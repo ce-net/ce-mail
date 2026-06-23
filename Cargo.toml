@@ -1,0 +1,42 @@
+[package]
+name = "ce-mail"
+version = "0.1.0"
+edition = "2024"
+description = "Decentralized, identity-native email/messaging between CE identities over the mesh — store-and-forward, E2E-encrypted, capability-gated."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-mail"
+authors = ["Leif Rydenfalk <ledamecrydenfalk@gmail.com>"]
+keywords = ["ce", "email", "p2p", "messaging", "decentralized"]
+categories = ["email", "network-programming"]
+
+[lib]
+name = "ce_mail"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ce-mail"
+path = "src/main.rs"
+
+[dependencies]
+ce-rs = { path = "../ce-rs" }
+ce-cap = { path = "../ce/crates/ce-cap" }
+ce-identity = { path = "../ce/crates/ce-identity" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+sha2 = "0.10"
+hex = "0.4"
+# X25519 ECDH + ChaCha20-Poly1305 AEAD sealed-box E2E body encryption.
+# Built directly on the dalek/RustCrypto building blocks (same ones ce-identity uses),
+# so the whole tree resolves from the workspace's existing crypto deps.
+curve25519-dalek = "4"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+directories = "5"
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
