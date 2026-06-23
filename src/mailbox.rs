@@ -132,12 +132,20 @@ impl MailboxStore {
             return Ok(Accepted::Duplicate);
         }
         seen.insert(mid);
-        let q = self.queues.entry(to).or_default();
+        let q = self.queues.entry(to.clone()).or_default();
         q.push(StoredEnvelope { envelope, stored_at: now });
         // Bounded retention: evict the oldest beyond capacity.
         if q.len() > self.capacity_per_recipient {
             let overflow = q.len() - self.capacity_per_recipient;
-            q.drain(0..overflow);
+            // Evict oldest; also forget their message ids so the bound on `seen` holds
+            // (otherwise sustained overflow grows `seen` without limit — a memory-exhaustion vector).
+            let evicted: Vec<String> =
+                q.drain(0..overflow).map(|s| s.envelope.message_id()).collect();
+            if let Some(s) = self.seen.get_mut(&to) {
+                for k in evicted {
+                    s.remove(&k);
+                }
+            }
         }
         Ok(Accepted::Stored)
     }
@@ -432,6 +440,34 @@ mod tests {
         let (msgs, _) = store.read_from(&recip.node_id_hex(), 0);
         assert_eq!(msgs[0].envelope.body.subject, "k2");
         assert_eq!(msgs[1].envelope.body.subject, "k3");
+    }
+
+    #[test]
+    fn seen_stays_bounded_under_sustained_overflow() {
+        // Regression: evicted envelopes must also be forgotten from `seen`, otherwise sustained
+        // overflow grows the de-dup index without limit — a memory-exhaustion vector.
+        let mailbox = id("mb-seen");
+        let sender = id("snd-seen");
+        let recip = id("rcp-seen");
+        let cap = 4usize;
+        let mut store = MailboxStore::new(mailbox.node_id(), cap);
+        // Deliver far more distinct envelopes than capacity.
+        for i in 0..200u64 {
+            store
+                .accept(envelope_to(&sender, &recip.node_id_hex(), &format!("s{i}")), i)
+                .unwrap();
+        }
+        // The queue is bounded by capacity.
+        assert_eq!(store.pending_count(&recip.node_id_hex()), cap);
+        // And so is the `seen` set — it must not have accumulated all 200 ids.
+        let seen_len = store.seen.get(&recip.node_id_hex()).map(|s| s.len()).unwrap_or(0);
+        assert_eq!(
+            seen_len, cap,
+            "seen index grew unbounded under overflow (was {seen_len}, expected {cap})"
+        );
+        // Surviving (most-recent) envelopes are still de-duplicated: re-delivering one is a duplicate.
+        let still_here = envelope_to(&sender, &recip.node_id_hex(), "s199");
+        assert_eq!(store.accept(still_here, 999).unwrap(), Accepted::Duplicate);
     }
 
     #[test]
