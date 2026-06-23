@@ -9,6 +9,7 @@
 //! malformed-input tests) without any network.
 
 use crate::envelope::Envelope;
+use crate::receipt::Receipt;
 use anyhow::{Result, anyhow};
 use ce_cap::SignedCapability;
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,33 @@ pub enum MailRequest {
         #[serde(default)]
         grant: Vec<SignedCapability>,
     },
+    /// Drain a bounded *page* of a recipient's inbox: at most `limit` envelopes from cursor `since`.
+    /// Lets a client page through a large inbox instead of pulling everything at once. The mailbox
+    /// returns the page, the cursor advanced past it, and whether more remain.
+    DrainPage {
+        recipient: String,
+        since: usize,
+        limit: usize,
+        #[serde(default)]
+        grant: Vec<SignedCapability>,
+    },
+    /// Deposit a signed [`Receipt`] (delivery/read acknowledgement) at the mailbox, addressed to the
+    /// original sender, for the sender to collect later. Idempotent: re-depositing the same receipt
+    /// is a no-op. `for_sender` is the original sender's NodeId (hex) — whose receipt mailbox this
+    /// goes to. `grant` proves the mailbox may accept on the sender's behalf (same ABILITY_ACCEPT).
+    PutReceipt {
+        for_sender: String,
+        receipt: Receipt,
+        #[serde(default)]
+        grant: Vec<SignedCapability>,
+    },
+    /// Collect receipts addressed to `sender` (the requester). Returns all signed receipts and frees
+    /// them. `grant` is empty when the requester *is* the sender (fast path).
+    CollectReceipts {
+        sender: String,
+        #[serde(default)]
+        grant: Vec<SignedCapability>,
+    },
 }
 
 /// A reply from a recipient or mailbox node.
@@ -55,8 +83,14 @@ pub enum MailReply {
     Delivered { duplicate: bool },
     /// Drain result: the envelopes from the requested cursor onward and the new cursor.
     Drained { envelopes: Vec<Envelope>, cursor: usize },
+    /// Paginated drain result: a bounded page, the advanced cursor, and whether more remain.
+    Page { envelopes: Vec<Envelope>, cursor: usize, more: bool },
     /// Ack result: how many envelopes were freed.
     Acked { removed: usize },
+    /// A receipt was accepted (stored or already present).
+    ReceiptAccepted { duplicate: bool },
+    /// Collected receipts addressed to the requester.
+    Receipts { receipts: Vec<Receipt> },
     /// The request was rejected (unauthorized, malformed, etc.).
     Error { message: String },
 }
@@ -152,12 +186,58 @@ mod tests {
             MailReply::Delivered { duplicate: false },
             MailReply::Delivered { duplicate: true },
             MailReply::Drained { envelopes: vec![], cursor: 5 },
+            MailReply::Page { envelopes: vec![], cursor: 3, more: true },
             MailReply::Acked { removed: 2 },
+            MailReply::ReceiptAccepted { duplicate: false },
+            MailReply::Receipts { receipts: vec![] },
             MailReply::Error { message: "nope".into() },
         ] {
             let back = MailReply::decode(&r.encode()).unwrap();
             assert_eq!(format!("{back:?}"), format!("{r:?}"));
         }
+    }
+
+    #[test]
+    fn drain_page_request_roundtrip() {
+        let req =
+            MailRequest::DrainPage { recipient: "ab".repeat(32), since: 2, limit: 10, grant: vec![] };
+        let back = MailRequest::decode(&req.encode()).unwrap();
+        match back {
+            MailRequest::DrainPage { recipient, since, limit, .. } => {
+                assert_eq!(recipient, "ab".repeat(32));
+                assert_eq!(since, 2);
+                assert_eq!(limit, 10);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn put_receipt_request_roundtrip() {
+        use crate::receipt::{Receipt, ReceiptKind};
+        let recip = id("p-rcpt");
+        let receipt = Receipt::issue(&recip, &"ab".repeat(32), ReceiptKind::Read, 9);
+        let req = MailRequest::PutReceipt {
+            for_sender: "cd".repeat(32),
+            receipt: receipt.clone(),
+            grant: vec![],
+        };
+        let back = MailRequest::decode(&req.encode()).unwrap();
+        match back {
+            MailRequest::PutReceipt { for_sender, receipt: r, .. } => {
+                assert_eq!(for_sender, "cd".repeat(32));
+                assert_eq!(r, receipt);
+                assert!(r.verify().is_ok());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn collect_receipts_request_roundtrip() {
+        let req = MailRequest::CollectReceipts { sender: "ef".repeat(32), grant: vec![] };
+        let back = MailRequest::decode(&req.encode()).unwrap();
+        matches!(back, MailRequest::CollectReceipts { .. });
     }
 
     #[test]

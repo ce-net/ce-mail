@@ -19,10 +19,13 @@
 //!
 //! * [`crypto`] — Ed25519→X25519 sealed-box E2E body encryption.
 //! * [`envelope`] — the small signed envelope (metadata + body CID); encode/verify.
-//! * [`proto`] — the mesh request/reply protocol (`Deliver`/`Drain`/`Ack`).
-//! * [`mailbox`] — the store-and-forward store + the capability gate.
+//! * [`thread`] — conversation modeling: `in_reply_to` chain resolution, subject normalization,
+//!   grouping a flat inbox into ordered [`thread::Conversation`]s.
+//! * [`receipt`] — signed delivery/read receipts the sender can verify and collect.
+//! * [`proto`] — the mesh request/reply protocol (`Deliver`/`Drain`/`DrainPage`/`Ack`/receipts).
+//! * [`mailbox`] — the store-and-forward store (paginated) + a receipt mailbox + the capability gate.
 //! * [`service`] — turns inbound requests into store operations (mailbox-node side).
-//! * [`client`] — the high-level [`client::MailClient`]: `send`, `drain_inbox`, `open_body`.
+//! * [`client`] — the high-level [`client::MailClient`]: `send`, `drain_inbox`, pagination, receipts.
 //!
 //! ## Minimal flow
 //!
@@ -51,11 +54,15 @@ pub mod crypto;
 pub mod envelope;
 pub mod mailbox;
 pub mod proto;
+pub mod receipt;
 pub mod service;
+pub mod thread;
 
 pub use client::{CeTransport, MailClient, Message, SendOptions, Transport};
 pub use crypto::SealedBody;
 pub use envelope::{Envelope, EnvelopeBody, MessageId, message_id};
 pub use mailbox::{ABILITY_ACCEPT, Accepted, MailboxStore, StoredEnvelope};
 pub use proto::{MAIL_TOPIC, MailReply, MailRequest};
+pub use receipt::{Receipt, ReceiptBody, ReceiptKind};
 pub use service::MailService;
+pub use thread::{Conversation, group_threads, normalize_subject, thread_root};

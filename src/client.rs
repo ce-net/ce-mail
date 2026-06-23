@@ -12,6 +12,8 @@
 use crate::crypto::{self, SealedBody};
 use crate::envelope::{Envelope, EnvelopeBody, parse_node_id};
 use crate::proto::{MAIL_TOPIC, MailReply, MailRequest};
+use crate::receipt::{Receipt, ReceiptKind};
+use crate::thread::{Conversation, group_threads};
 use anyhow::{Result, anyhow};
 use ce_cap::SignedCapability;
 use ce_identity::Identity;
@@ -183,16 +185,95 @@ impl<T: Transport> MailClient<T> {
             MailReply::Error { message } => return Err(anyhow!("drain rejected: {message}")),
             other => return Err(anyhow!("unexpected reply to Drain: {other:?}")),
         };
+        let out = self.compose_messages(envelopes).await;
+        Ok((out, cursor))
+    }
+
+    /// Drain a bounded *page* of the inbox: at most `limit` decrypted messages from cursor `since`.
+    /// Returns `(messages, next_cursor, more)`. Use this to page through a large inbox instead of
+    /// pulling everything in one round-trip.
+    pub async fn drain_inbox_page(
+        &self,
+        mailbox: &str,
+        since: usize,
+        limit: usize,
+        grant: Vec<SignedCapability>,
+    ) -> Result<(Vec<Message>, usize, bool)> {
+        let req =
+            MailRequest::DrainPage { recipient: self.node_id_hex(), since, limit, grant };
+        let reply = self.round_trip(mailbox, req).await?;
+        let (envelopes, cursor, more) = match reply {
+            MailReply::Page { envelopes, cursor, more } => (envelopes, cursor, more),
+            MailReply::Error { message } => return Err(anyhow!("drain page rejected: {message}")),
+            other => return Err(anyhow!("unexpected reply to DrainPage: {other:?}")),
+        };
+        let messages = self.compose_messages(envelopes).await;
+        Ok((messages, cursor, more))
+    }
+
+    /// Drain the whole inbox and group it into [`Conversation`]s (threaded view). A convenience over
+    /// [`drain_inbox`](Self::drain_inbox) + [`group_threads`].
+    pub async fn drain_inbox_threaded(
+        &self,
+        mailbox: &str,
+        since: usize,
+        grant: Vec<SignedCapability>,
+    ) -> Result<(Vec<Conversation>, usize)> {
+        let (msgs, cursor) = self.drain_inbox(mailbox, since, grant).await?;
+        let envelopes: Vec<Envelope> = msgs.into_iter().map(|m| m.envelope).collect();
+        Ok((group_threads(&envelopes), cursor))
+    }
+
+    /// Verify, fetch, and decrypt a batch of envelopes into [`Message`]s, skipping any single bad
+    /// envelope (failure isolation) and tolerating missing bodies.
+    async fn compose_messages(&self, envelopes: Vec<Envelope>) -> Vec<Message> {
         let mut out = Vec::with_capacity(envelopes.len());
         for env in envelopes {
-            // Skip (don't fail the whole drain on) any single bad envelope: failure isolation.
             if env.verify().is_err() {
                 continue;
             }
             let body = self.open_body(&env).await.unwrap_or_default();
             out.push(Message { envelope: env, body });
         }
-        Ok((out, cursor))
+        out
+    }
+
+    /// Issue a signed [`Receipt`] for `message_id` and deposit it at `mailbox` for `for_sender` to
+    /// collect. `kind` distinguishes a delivery acknowledgement from a read acknowledgement. The
+    /// receipt is signed by *this* client, so the sender can verify who acknowledged.
+    pub async fn send_receipt(
+        &self,
+        mailbox: &str,
+        for_sender: &str,
+        message_id: &str,
+        kind: ReceiptKind,
+        grant: Vec<SignedCapability>,
+    ) -> Result<bool> {
+        let receipt = Receipt::issue(&self.identity, message_id, kind, now_secs());
+        let req = MailRequest::PutReceipt { for_sender: for_sender.to_string(), receipt, grant };
+        match self.round_trip(mailbox, req).await? {
+            MailReply::ReceiptAccepted { duplicate } => Ok(duplicate),
+            MailReply::Error { message } => Err(anyhow!("receipt rejected: {message}")),
+            other => Err(anyhow!("unexpected reply to PutReceipt: {other:?}")),
+        }
+    }
+
+    /// Collect receipts addressed to *this* client from `mailbox`. Returns only receipts whose
+    /// signature verifies (a malicious mailbox cannot inject forged acknowledgements). `grant` is
+    /// empty when you are the sender (fast path).
+    pub async fn collect_receipts(
+        &self,
+        mailbox: &str,
+        grant: Vec<SignedCapability>,
+    ) -> Result<Vec<Receipt>> {
+        let req = MailRequest::CollectReceipts { sender: self.node_id_hex(), grant };
+        match self.round_trip(mailbox, req).await? {
+            MailReply::Receipts { receipts } => {
+                Ok(receipts.into_iter().filter(|r| r.verify().is_ok()).collect())
+            }
+            MailReply::Error { message } => Err(anyhow!("collect rejected: {message}")),
+            other => Err(anyhow!("unexpected reply to CollectReceipts: {other:?}")),
+        }
     }
 
     /// Acknowledge delivery up to `cursor` at the mailbox, freeing storage.
@@ -468,6 +549,203 @@ mod tests {
         // Envelope still delivered; body is empty because the blob was unreachable (graceful).
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn paginated_drain_covers_all_messages() {
+        let net = FakeNet::new();
+        let mailbox = id("pg-mb");
+        let recipient = id("pg-rc");
+        let sender = id("pg-sn");
+        net.install_service(
+            &mailbox.node_id_hex(),
+            MailService::new(MailboxStore::new(mailbox.node_id(), 100)),
+        );
+        let sclient =
+            MailClient::new(sender_dup(&sender), FakeHandle { net: net.clone(), me: sender.node_id() });
+        for i in 0..5 {
+            sclient
+                .send(SendOptions {
+                    to: recipient.node_id_hex(),
+                    subject: format!("p{i}"),
+                    body: format!("b{i}").into_bytes(),
+                    mailbox: Some(mailbox.node_id_hex()),
+                    grant: accept_grant(&recipient, &mailbox),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let rclient = MailClient::new(
+            sender_dup(&recipient),
+            FakeHandle { net: net.clone(), me: recipient.node_id() },
+        );
+        let mut cursor = 0;
+        let mut bodies = Vec::new();
+        loop {
+            let (msgs, next, more) =
+                rclient.drain_inbox_page(&mailbox.node_id_hex(), cursor, 2, vec![]).await.unwrap();
+            assert!(msgs.len() <= 2);
+            for m in msgs {
+                bodies.push(m.body_text());
+            }
+            cursor = next;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(bodies, (0..5).map(|i| format!("b{i}")).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn read_receipt_round_trip() {
+        // Recipient drains, sends a read receipt; the sender collects and verifies it.
+        let net = FakeNet::new();
+        let mailbox = id("rcpt-mb");
+        let recipient = id("rcpt-rc");
+        let sender = id("rcpt-sn");
+        net.install_service(
+            &mailbox.node_id_hex(),
+            MailService::new(MailboxStore::new(mailbox.node_id(), 100)),
+        );
+        let sclient =
+            MailClient::new(sender_dup(&sender), FakeHandle { net: net.clone(), me: sender.node_id() });
+        let mid = sclient
+            .send(SendOptions {
+                to: recipient.node_id_hex(),
+                subject: "please ack".into(),
+                body: b"read me".to_vec(),
+                mailbox: Some(mailbox.node_id_hex()),
+                grant: accept_grant(&recipient, &mailbox),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let rclient = MailClient::new(
+            sender_dup(&recipient),
+            FakeHandle { net: net.clone(), me: recipient.node_id() },
+        );
+        let (msgs, _) = rclient.drain_inbox(&mailbox.node_id_hex(), 0, vec![]).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        // The recipient deposits a read receipt for the sender (sender delegated this mailbox).
+        let dup = rclient
+            .send_receipt(
+                &mailbox.node_id_hex(),
+                &sender.node_id_hex(),
+                &msgs[0].id(),
+                ReceiptKind::Read,
+                accept_grant(&sender, &mailbox),
+            )
+            .await
+            .unwrap();
+        assert!(!dup);
+
+        // The sender collects the receipt.
+        let receipts = sclient.collect_receipts(&mailbox.node_id_hex(), vec![]).await.unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].body.message_id, mid);
+        assert_eq!(receipts[0].body.by, recipient.node_id_hex());
+        assert_eq!(receipts[0].body.kind, ReceiptKind::Read);
+        assert!(receipts[0].verify().is_ok());
+    }
+
+    #[tokio::test]
+    async fn duplicate_receipt_deposit_reports_duplicate() {
+        let net = FakeNet::new();
+        let mailbox = id("dr-mb");
+        let recipient = id("dr-rc");
+        let sender = id("dr-sn");
+        net.install_service(
+            &mailbox.node_id_hex(),
+            MailService::new(MailboxStore::new(mailbox.node_id(), 100)),
+        );
+        let rclient = MailClient::new(
+            sender_dup(&recipient),
+            FakeHandle { net: net.clone(), me: recipient.node_id() },
+        );
+        let mid = "ab".repeat(32);
+        let first = rclient
+            .send_receipt(
+                &mailbox.node_id_hex(),
+                &sender.node_id_hex(),
+                &mid,
+                ReceiptKind::Delivered,
+                accept_grant(&sender, &mailbox),
+            )
+            .await
+            .unwrap();
+        assert!(!first);
+        let second = rclient
+            .send_receipt(
+                &mailbox.node_id_hex(),
+                &sender.node_id_hex(),
+                &mid,
+                ReceiptKind::Delivered,
+                accept_grant(&sender, &mailbox),
+            )
+            .await
+            .unwrap();
+        assert!(second, "second identical receipt deposit must be a duplicate");
+    }
+
+    #[tokio::test]
+    async fn threaded_drain_groups_conversation() {
+        let net = FakeNet::new();
+        let mailbox = id("td-mb");
+        let recipient = id("td-rc");
+        let sender = id("td-sn");
+        net.install_service(
+            &mailbox.node_id_hex(),
+            MailService::new(MailboxStore::new(mailbox.node_id(), 100)),
+        );
+        let sclient =
+            MailClient::new(sender_dup(&sender), FakeHandle { net: net.clone(), me: sender.node_id() });
+        // Root message.
+        let root = sclient
+            .send(SendOptions {
+                to: recipient.node_id_hex(),
+                subject: "topic".into(),
+                body: b"start".to_vec(),
+                mailbox: Some(mailbox.node_id_hex()),
+                grant: accept_grant(&recipient, &mailbox),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // A reply on the same thread, plus an unrelated message.
+        sclient
+            .send(SendOptions {
+                to: recipient.node_id_hex(),
+                subject: "Re: topic".into(),
+                body: b"continued".to_vec(),
+                in_reply_to: root.clone(),
+                mailbox: Some(mailbox.node_id_hex()),
+                grant: accept_grant(&recipient, &mailbox),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        sclient
+            .send(SendOptions {
+                to: recipient.node_id_hex(),
+                subject: "unrelated".into(),
+                body: b"other".to_vec(),
+                mailbox: Some(mailbox.node_id_hex()),
+                grant: accept_grant(&recipient, &mailbox),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let rclient = MailClient::new(
+            sender_dup(&recipient),
+            FakeHandle { net: net.clone(), me: recipient.node_id() },
+        );
+        let (convs, _) = rclient.drain_inbox_threaded(&mailbox.node_id_hex(), 0, vec![]).await.unwrap();
+        assert_eq!(convs.len(), 2);
+        let topic = convs.iter().find(|c| c.root == root).unwrap();
+        assert_eq!(topic.len(), 2);
     }
 
     #[tokio::test]

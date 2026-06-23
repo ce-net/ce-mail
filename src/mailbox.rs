@@ -21,6 +21,7 @@
 //! recipients that have explicitly delegated to it.
 
 use crate::envelope::Envelope;
+use crate::receipt::Receipt;
 use anyhow::{Result, anyhow};
 use ce_cap::{SignedCapability, authorize};
 use ce_identity::NodeId;
@@ -46,6 +47,10 @@ pub struct MailboxStore {
     queues: HashMap<String, Vec<StoredEnvelope>>,
     /// message ids already stored per recipient, for idempotent delivery.
     seen: HashMap<String, std::collections::HashSet<String>>,
+    /// sender_hex -> receipts addressed to that sender, de-duped by receipt key (idempotent deposit).
+    receipts: HashMap<String, Vec<Receipt>>,
+    /// receipt dedup keys already stored per sender, for idempotent receipt deposit.
+    receipts_seen: HashMap<String, std::collections::HashSet<String>>,
     /// Max envelopes retained per recipient (oldest evicted past this — bounded memory).
     capacity_per_recipient: usize,
 }
@@ -67,6 +72,8 @@ impl MailboxStore {
             self_id,
             queues: HashMap::new(),
             seen: HashMap::new(),
+            receipts: HashMap::new(),
+            receipts_seen: HashMap::new(),
             capacity_per_recipient: capacity_per_recipient.max(1),
         }
     }
@@ -158,6 +165,74 @@ impl MailboxStore {
         }
     }
 
+    /// Read a bounded *page* of at most `limit` envelopes starting at cursor `since` for
+    /// `recipient_hex`. Returns `(page, next_cursor, more)` where `next_cursor` is `since + page.len()`
+    /// and `more` is true when envelopes remain beyond the page. A `limit` of 0 is treated as 1 so a
+    /// caller always makes progress. Like [`read_from`](Self::read_from) this is non-destructive
+    /// (replay-safe): call [`ack`](Self::ack) to free what was delivered.
+    pub fn read_page(
+        &self,
+        recipient_hex: &str,
+        since: usize,
+        limit: usize,
+    ) -> (Vec<StoredEnvelope>, usize, bool) {
+        let limit = limit.max(1);
+        match self.queues.get(recipient_hex) {
+            Some(q) if since < q.len() => {
+                let end = (since + limit).min(q.len());
+                let page = q[since..end].to_vec();
+                let more = end < q.len();
+                (page, end, more)
+            }
+            Some(q) => (Vec::new(), q.len(), false),
+            None => (Vec::new(), 0, false),
+        }
+    }
+
+    /// Deposit a signed [`Receipt`] addressed to `for_sender_hex`. Verifies the receipt signature,
+    /// then stores it de-duplicated by [`Receipt::dedup_key`]. Idempotent: re-depositing the same
+    /// receipt returns [`Accepted::Duplicate`]. The mailbox cannot forge a receipt (it lacks the
+    /// recipient's key) and cannot grow unboundedly per sender (capacity-bounded like the inbox).
+    pub fn put_receipt(&mut self, for_sender_hex: &str, receipt: Receipt) -> Result<Accepted> {
+        receipt
+            .verify()
+            .map_err(|e| anyhow!("refusing to store unverifiable receipt: {e}"))?;
+        if for_sender_hex.is_empty() {
+            return Err(anyhow!("receipt has no target sender"));
+        }
+        let key = receipt.dedup_key();
+        let seen = self.receipts_seen.entry(for_sender_hex.to_string()).or_default();
+        if seen.contains(&key) {
+            return Ok(Accepted::Duplicate);
+        }
+        seen.insert(key);
+        let q = self.receipts.entry(for_sender_hex.to_string()).or_default();
+        q.push(receipt);
+        if q.len() > self.capacity_per_recipient {
+            let overflow = q.len() - self.capacity_per_recipient;
+            // Evict oldest; also forget their dedup keys so the bound on `receipts_seen` holds.
+            let evicted: Vec<String> = q.drain(0..overflow).map(|r| r.dedup_key()).collect();
+            if let Some(s) = self.receipts_seen.get_mut(for_sender_hex) {
+                for k in evicted {
+                    s.remove(&k);
+                }
+            }
+        }
+        Ok(Accepted::Stored)
+    }
+
+    /// Number of receipts pending for `sender_hex`.
+    pub fn receipt_count(&self, sender_hex: &str) -> usize {
+        self.receipts.get(sender_hex).map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// Collect (return and remove) all receipts addressed to `sender_hex`. Removing them is safe
+    /// because each is independently signed — the sender can re-store any it wants to keep.
+    pub fn collect_receipts(&mut self, sender_hex: &str) -> Vec<Receipt> {
+        self.receipts_seen.remove(sender_hex);
+        self.receipts.remove(sender_hex).unwrap_or_default()
+    }
+
     /// Acknowledge delivery up to (and including) `up_to_cursor` for `recipient_hex`, removing those
     /// envelopes from the store. Safe to call with any cursor; out-of-range is clamped. Returns the
     /// number removed.
@@ -173,19 +248,52 @@ impl MailboxStore {
     }
 
     /// Serialize the whole store to bytes (for persistence across restarts).
+    ///
+    /// Format is a magic-tagged tuple so newer stores carry the receipt table while older 3-tuple
+    /// stores ([`from_bytes`](Self::from_bytes) still reads them) load with empty receipts. The
+    /// `seen` / `receipts_seen` de-dup indexes are rebuilt on load, not persisted.
     pub fn to_bytes(&self) -> Vec<u8> {
-        // Persist only the durable queues; `seen` is rebuilt from them on load.
-        bincode::serialize(&(self.self_id, &self.queues, self.capacity_per_recipient))
-            .unwrap_or_default()
+        bincode::serialize(&(
+            STORE_MAGIC,
+            self.self_id,
+            &self.queues,
+            self.capacity_per_recipient,
+            &self.receipts,
+        ))
+        .unwrap_or_default()
     }
 
-    /// Load a store from bytes produced by [`to_bytes`](Self::to_bytes). Rebuilds the de-dup index.
+    /// Load a store from bytes produced by [`to_bytes`](Self::to_bytes), or by an older version that
+    /// predates the receipt table. Rebuilds the de-dup indexes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        // Try the current (v2, receipt-carrying) format first.
+        if let Ok((magic, self_id, queues, capacity, receipts)) = bincode::deserialize::<(
+            u32,
+            NodeId,
+            HashMap<String, Vec<StoredEnvelope>>,
+            usize,
+            HashMap<String, Vec<Receipt>>,
+        )>(bytes)
+            && magic == STORE_MAGIC
+        {
+            return Ok(Self::rebuild(self_id, queues, capacity, receipts));
+        }
+        // Fall back to the legacy v1 (3-tuple, no receipts) format.
         let (self_id, queues, capacity_per_recipient): (
             NodeId,
             HashMap<String, Vec<StoredEnvelope>>,
             usize,
         ) = bincode::deserialize(bytes).map_err(|e| anyhow!("malformed mailbox store: {e}"))?;
+        Ok(Self::rebuild(self_id, queues, capacity_per_recipient, HashMap::new()))
+    }
+
+    /// Rebuild the in-memory store (including de-dup indexes) from persisted parts.
+    fn rebuild(
+        self_id: NodeId,
+        queues: HashMap<String, Vec<StoredEnvelope>>,
+        capacity_per_recipient: usize,
+        receipts: HashMap<String, Vec<Receipt>>,
+    ) -> Self {
         let mut seen: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
         for (recipient, q) in &queues {
             let set = seen.entry(recipient.clone()).or_default();
@@ -193,9 +301,26 @@ impl MailboxStore {
                 set.insert(stored.envelope.message_id());
             }
         }
-        Ok(MailboxStore { self_id, queues, seen, capacity_per_recipient: capacity_per_recipient.max(1) })
+        let mut receipts_seen: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for (sender, q) in &receipts {
+            let set = receipts_seen.entry(sender.clone()).or_default();
+            for r in q {
+                set.insert(r.dedup_key());
+            }
+        }
+        MailboxStore {
+            self_id,
+            queues,
+            seen,
+            receipts,
+            receipts_seen,
+            capacity_per_recipient: capacity_per_recipient.max(1),
+        }
     }
 }
+
+/// Magic prefix tagging the v2 (receipt-carrying) on-disk store format.
+const STORE_MAGIC: u32 = 0x4345_4d32; // "CEM2"
 
 #[cfg(test)]
 mod tests {
@@ -341,6 +466,218 @@ mod tests {
         let (second, _) = store.read_from(&recip.node_id_hex(), cursor);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].envelope.body.subject, "b");
+    }
+
+    // ---- pagination ----
+
+    #[test]
+    fn read_page_bounds_and_signals_more() {
+        let mailbox = id("pg1");
+        let sender = id("pg1s");
+        let recip = id("pg1r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        for i in 0..5 {
+            store.accept(envelope_to(&sender, &recip.node_id_hex(), &format!("p{i}")), i).unwrap();
+        }
+        // First page of 2.
+        let (page, cursor, more) = store.read_page(&recip.node_id_hex(), 0, 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(cursor, 2);
+        assert!(more);
+        assert_eq!(page[0].envelope.body.subject, "p0");
+        // Second page of 2.
+        let (page, cursor, more) = store.read_page(&recip.node_id_hex(), cursor, 2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(cursor, 4);
+        assert!(more);
+        // Final page: 1 remaining, no more.
+        let (page, cursor, more) = store.read_page(&recip.node_id_hex(), cursor, 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(cursor, 5);
+        assert!(!more);
+        assert_eq!(page[0].envelope.body.subject, "p4");
+    }
+
+    #[test]
+    fn read_page_limit_zero_treated_as_one() {
+        let mailbox = id("pg2");
+        let sender = id("pg2s");
+        let recip = id("pg2r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        store.accept(envelope_to(&sender, &recip.node_id_hex(), "a"), 1).unwrap();
+        store.accept(envelope_to(&sender, &recip.node_id_hex(), "b"), 2).unwrap();
+        let (page, _, more) = store.read_page(&recip.node_id_hex(), 0, 0);
+        assert_eq!(page.len(), 1);
+        assert!(more);
+    }
+
+    #[test]
+    fn read_page_past_end_is_empty() {
+        let mailbox = id("pg3");
+        let sender = id("pg3s");
+        let recip = id("pg3r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        store.accept(envelope_to(&sender, &recip.node_id_hex(), "a"), 1).unwrap();
+        let (page, cursor, more) = store.read_page(&recip.node_id_hex(), 5, 10);
+        assert!(page.is_empty());
+        assert_eq!(cursor, 1);
+        assert!(!more);
+    }
+
+    #[test]
+    fn read_page_unknown_recipient_is_empty() {
+        let mailbox = id("pg4");
+        let store = MailboxStore::new(mailbox.node_id(), 100);
+        let (page, cursor, more) = store.read_page("nobody", 0, 10);
+        assert!(page.is_empty());
+        assert_eq!(cursor, 0);
+        assert!(!more);
+    }
+
+    #[test]
+    fn full_pagination_covers_all_without_overlap() {
+        let mailbox = id("pg5");
+        let sender = id("pg5s");
+        let recip = id("pg5r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        for i in 0..7u64 {
+            store.accept(envelope_to(&sender, &recip.node_id_hex(), &format!("m{i}")), i).unwrap();
+        }
+        let mut cursor = 0;
+        let mut collected = Vec::new();
+        loop {
+            let (page, next, more) = store.read_page(&recip.node_id_hex(), cursor, 3);
+            for s in page {
+                collected.push(s.envelope.body.subject.clone());
+            }
+            cursor = next;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(collected, (0..7).map(|i| format!("m{i}")).collect::<Vec<_>>());
+    }
+
+    // ---- receipts ----
+
+    fn receipt_for(recip: &Identity, mid: &str, kind: crate::receipt::ReceiptKind) -> Receipt {
+        Receipt::issue(recip, mid, kind, 100)
+    }
+
+    #[test]
+    fn put_and_collect_receipt_roundtrip() {
+        use crate::receipt::ReceiptKind;
+        let mailbox = id("rc1");
+        let sender = id("rc1s");
+        let recip = id("rc1r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        let r = receipt_for(&recip, &"ab".repeat(32), ReceiptKind::Delivered);
+        assert_eq!(store.put_receipt(&sender.node_id_hex(), r).unwrap(), Accepted::Stored);
+        assert_eq!(store.receipt_count(&sender.node_id_hex()), 1);
+        let collected = store.collect_receipts(&sender.node_id_hex());
+        assert_eq!(collected.len(), 1);
+        assert!(collected[0].verify().is_ok());
+        // Collection freed them.
+        assert_eq!(store.receipt_count(&sender.node_id_hex()), 0);
+    }
+
+    #[test]
+    fn duplicate_receipt_is_idempotent() {
+        use crate::receipt::ReceiptKind;
+        let mailbox = id("rc2");
+        let sender = id("rc2s");
+        let recip = id("rc2r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        let r = receipt_for(&recip, &"ab".repeat(32), ReceiptKind::Read);
+        assert_eq!(store.put_receipt(&sender.node_id_hex(), r.clone()).unwrap(), Accepted::Stored);
+        assert_eq!(store.put_receipt(&sender.node_id_hex(), r).unwrap(), Accepted::Duplicate);
+        assert_eq!(store.receipt_count(&sender.node_id_hex()), 1);
+    }
+
+    #[test]
+    fn delivered_and_read_receipts_coexist() {
+        use crate::receipt::ReceiptKind;
+        let mailbox = id("rc3");
+        let sender = id("rc3s");
+        let recip = id("rc3r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        let mid = "ab".repeat(32);
+        store.put_receipt(&sender.node_id_hex(), receipt_for(&recip, &mid, ReceiptKind::Delivered)).unwrap();
+        store.put_receipt(&sender.node_id_hex(), receipt_for(&recip, &mid, ReceiptKind::Read)).unwrap();
+        // Different kinds for the same message are distinct receipts.
+        assert_eq!(store.receipt_count(&sender.node_id_hex()), 2);
+    }
+
+    #[test]
+    fn put_receipt_rejects_forged() {
+        use crate::receipt::ReceiptKind;
+        let mailbox = id("rc4");
+        let sender = id("rc4s");
+        let recip = id("rc4r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        let mut r = receipt_for(&recip, &"ab".repeat(32), ReceiptKind::Read);
+        r.body.at = 999; // breaks the signature
+        assert!(store.put_receipt(&sender.node_id_hex(), r).is_err());
+        assert_eq!(store.receipt_count(&sender.node_id_hex()), 0);
+    }
+
+    #[test]
+    fn put_receipt_rejects_empty_target() {
+        use crate::receipt::ReceiptKind;
+        let mailbox = id("rc5");
+        let recip = id("rc5r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        let r = receipt_for(&recip, &"ab".repeat(32), ReceiptKind::Read);
+        assert!(store.put_receipt("", r).is_err());
+    }
+
+    #[test]
+    fn receipt_capacity_evicts_oldest_and_forgets_dedup() {
+        use crate::receipt::ReceiptKind;
+        let mailbox = id("rc6");
+        let sender = id("rc6s");
+        let mut store = MailboxStore::new(mailbox.node_id(), 2);
+        // Three distinct receipts (distinct recipients) for the same sender.
+        for i in 0..3 {
+            let recip = id(&format!("rc6r{i}"));
+            let r = receipt_for(&recip, &"ab".repeat(32), ReceiptKind::Delivered);
+            store.put_receipt(&sender.node_id_hex(), r).unwrap();
+        }
+        assert_eq!(store.receipt_count(&sender.node_id_hex()), 2);
+    }
+
+    #[test]
+    fn receipts_survive_persistence_roundtrip() {
+        use crate::receipt::ReceiptKind;
+        let mailbox = id("rc7");
+        let sender = id("rc7s");
+        let recip = id("rc7r");
+        let mut store = MailboxStore::new(mailbox.node_id(), 100);
+        // Also store an envelope so both tables persist.
+        store.accept(envelope_to(&sender, &recip.node_id_hex(), "m"), 1).unwrap();
+        let r = receipt_for(&recip, &"ab".repeat(32), ReceiptKind::Read);
+        store.put_receipt(&sender.node_id_hex(), r.clone()).unwrap();
+        let bytes = store.to_bytes();
+        let mut loaded = MailboxStore::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.receipt_count(&sender.node_id_hex()), 1);
+        assert_eq!(loaded.pending_count(&recip.node_id_hex()), 1);
+        // Rebuilt receipt dedup index: re-deposit is a duplicate.
+        assert_eq!(loaded.put_receipt(&sender.node_id_hex(), r).unwrap(), Accepted::Duplicate);
+    }
+
+    #[test]
+    fn legacy_v1_store_loads_with_empty_receipts() {
+        // Simulate a store persisted before the receipt table existed (the old 3-tuple format).
+        let mailbox = id("rc8");
+        let sender = id("rc8s");
+        let recip = id("rc8r");
+        let env = envelope_to(&sender, &recip.node_id_hex(), "legacy");
+        let mut queues: HashMap<String, Vec<StoredEnvelope>> = HashMap::new();
+        queues.insert(recip.node_id_hex(), vec![StoredEnvelope { envelope: env, stored_at: 1 }]);
+        let legacy = bincode::serialize(&(mailbox.node_id(), queues, 50usize)).unwrap();
+        let loaded = MailboxStore::from_bytes(&legacy).unwrap();
+        assert_eq!(loaded.pending_count(&recip.node_id_hex()), 1);
+        assert_eq!(loaded.receipt_count(&sender.node_id_hex()), 0);
     }
 
     // ---- capability gate ----

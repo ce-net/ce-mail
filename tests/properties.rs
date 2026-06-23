@@ -8,6 +8,8 @@ use ce_identity::Identity;
 use ce_mail::crypto::{self, SealedBody};
 use ce_mail::envelope::{Envelope, EnvelopeBody, message_id};
 use ce_mail::proto::{MailReply, MailRequest};
+use ce_mail::receipt::{Receipt, ReceiptKind};
+use ce_mail::thread::normalize_subject;
 use proptest::prelude::*;
 
 fn recipient() -> Identity {
@@ -108,5 +110,49 @@ proptest! {
         let i = idx % sealed.ciphertext.len();
         sealed.ciphertext[i] ^= 0xff;
         prop_assert!(crypto::open(&recip.secret_bytes(), &sealed).is_err());
+    }
+
+    /// normalize_subject is idempotent: normalizing an already-normalized subject is a no-op.
+    #[test]
+    fn normalize_subject_is_idempotent(subject in ".{0,200}") {
+        let once = normalize_subject(&subject);
+        let twice = normalize_subject(&once);
+        prop_assert_eq!(once, twice);
+    }
+
+    /// Prepending an arbitrary stack of reply/forward prefixes to a subject does not change its
+    /// normalized form — a reply always threads with its parent regardless of how many "Re:"s pile up.
+    #[test]
+    fn reply_prefixes_collapse_to_same_normalized_subject(
+        core in "[a-zA-Z][a-zA-Z0-9 ]{0,40}",
+        depth in 0usize..6,
+    ) {
+        let prefixes = ["Re: ", "Fwd: ", "RE: ", "fw: "];
+        let mut s = core.clone();
+        for i in 0..depth {
+            s = format!("{}{}", prefixes[i % prefixes.len()], s);
+        }
+        prop_assert_eq!(normalize_subject(&s), normalize_subject(&core));
+    }
+
+    /// A receipt issued for any message id and kind always verifies and round-trips.
+    #[test]
+    fn receipt_roundtrip_verifies(
+        mid in "[0-9a-f]{0,64}",
+        at in any::<u64>(),
+        read in any::<bool>(),
+    ) {
+        let recip = recipient();
+        let kind = if read { ReceiptKind::Read } else { ReceiptKind::Delivered };
+        let r = Receipt::issue(&recip, &mid, kind, at);
+        let back = Receipt::decode(&r.encode()).unwrap();
+        prop_assert_eq!(&r, &back);
+        prop_assert!(back.verify().is_ok());
+    }
+
+    /// Arbitrary bytes never panic the receipt decoder.
+    #[test]
+    fn decode_receipt_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+        let _ = Receipt::decode(&bytes);
     }
 }

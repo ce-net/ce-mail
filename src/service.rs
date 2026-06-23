@@ -96,6 +96,51 @@ impl MailService {
                 let removed = self.store.ack(&recipient, cursor);
                 MailReply::Acked { removed }
             }
+            MailRequest::DrainPage { recipient, since, limit, grant } => {
+                let recip = match parse_node_id(&recipient) {
+                    Ok(r) => r,
+                    Err(e) => return MailReply::Error { message: format!("bad recipient: {e}") },
+                };
+                if requester != &recip
+                    && let Err(e) = self.gate_delegate(&recip, requester, &grant, now, is_revoked)
+                {
+                    return MailReply::Error { message: e };
+                }
+                let (stored, cursor, more) = self.store.read_page(&recipient, since, limit);
+                let envelopes = stored.into_iter().map(|s| s.envelope).collect();
+                MailReply::Page { envelopes, cursor, more }
+            }
+            MailRequest::PutReceipt { for_sender, receipt, grant } => {
+                // The receipt is destined for `for_sender`'s receipt mailbox. The same accept-grant
+                // gate applies: the mailbox must be authorized to accept on the sender's behalf. (The
+                // depositor is the recipient acknowledging; authority comes from the sender, who
+                // delegated this mailbox.)
+                let sender = match parse_node_id(&for_sender) {
+                    Ok(r) => r,
+                    Err(e) => return MailReply::Error { message: format!("bad sender: {e}") },
+                };
+                if let Err(e) = self.store.check_accept_grant(&sender, &grant, now, is_revoked) {
+                    return MailReply::Error { message: e.to_string() };
+                }
+                match self.store.put_receipt(&for_sender, receipt) {
+                    Ok(Accepted::Stored) => MailReply::ReceiptAccepted { duplicate: false },
+                    Ok(Accepted::Duplicate) => MailReply::ReceiptAccepted { duplicate: true },
+                    Err(e) => MailReply::Error { message: e.to_string() },
+                }
+            }
+            MailRequest::CollectReceipts { sender, grant } => {
+                let snd = match parse_node_id(&sender) {
+                    Ok(r) => r,
+                    Err(e) => return MailReply::Error { message: format!("bad sender: {e}") },
+                };
+                if requester != &snd
+                    && let Err(e) = self.gate_delegate(&snd, requester, &grant, now, is_revoked)
+                {
+                    return MailReply::Error { message: e };
+                }
+                let receipts = self.store.collect_receipts(&sender);
+                MailReply::Receipts { receipts }
+            }
         }
     }
 
@@ -269,6 +314,122 @@ mod tests {
         );
         assert!(matches!(reply, MailReply::Acked { removed: 1 }));
         assert_eq!(svc.store().pending_count(&recipient.node_id_hex()), 0);
+    }
+
+    #[test]
+    fn drain_page_returns_bounded_page() {
+        let mailbox = id("svc-pg1");
+        let recipient = id("svc-pg1r");
+        let sender = id("svc-pg1s");
+        let mut svc = MailService::new(MailboxStore::new(mailbox.node_id(), 100));
+        let grant = accept_grant(&recipient, &mailbox);
+        for i in 0..3 {
+            svc.handle(
+                &sender.node_id(),
+                MailRequest::Deliver {
+                    envelope: envelope(&sender, &recipient.node_id_hex(), &format!("m{i}")),
+                    grant: grant.clone(),
+                },
+                1,
+                &never_revoked,
+            );
+        }
+        let reply = svc.handle(
+            &recipient.node_id(),
+            MailRequest::DrainPage { recipient: recipient.node_id_hex(), since: 0, limit: 2, grant: vec![] },
+            2,
+            &never_revoked,
+        );
+        match reply {
+            MailReply::Page { envelopes, cursor, more } => {
+                assert_eq!(envelopes.len(), 2);
+                assert_eq!(cursor, 2);
+                assert!(more);
+            }
+            _ => panic!("expected Page"),
+        }
+    }
+
+    #[test]
+    fn drain_page_stranger_rejected() {
+        let mailbox = id("svc-pg2");
+        let recipient = id("svc-pg2r");
+        let stranger = id("svc-pg2x");
+        let mut svc = MailService::new(MailboxStore::new(mailbox.node_id(), 100));
+        let reply = svc.handle(
+            &stranger.node_id(),
+            MailRequest::DrainPage { recipient: recipient.node_id_hex(), since: 0, limit: 5, grant: vec![] },
+            1,
+            &never_revoked,
+        );
+        assert!(matches!(reply, MailReply::Error { .. }));
+    }
+
+    #[test]
+    fn put_and_collect_receipt_via_service() {
+        use crate::receipt::{Receipt, ReceiptKind};
+        let mailbox = id("svc-rc1");
+        let sender = id("svc-rc1s");
+        let recipient = id("svc-rc1r");
+        let mut svc = MailService::new(MailboxStore::new(mailbox.node_id(), 100));
+        // The sender delegates this mailbox to accept on its behalf (for receipts).
+        let grant = accept_grant(&sender, &mailbox);
+        let receipt = Receipt::issue(&recipient, &"ab".repeat(32), ReceiptKind::Read, 5);
+        // The recipient deposits a read receipt for the sender.
+        let reply = svc.handle(
+            &recipient.node_id(),
+            MailRequest::PutReceipt { for_sender: sender.node_id_hex(), receipt, grant },
+            1,
+            &never_revoked,
+        );
+        assert!(matches!(reply, MailReply::ReceiptAccepted { duplicate: false }));
+        // The sender collects.
+        let reply = svc.handle(
+            &sender.node_id(),
+            MailRequest::CollectReceipts { sender: sender.node_id_hex(), grant: vec![] },
+            2,
+            &never_revoked,
+        );
+        match reply {
+            MailReply::Receipts { receipts } => {
+                assert_eq!(receipts.len(), 1);
+                assert!(receipts[0].verify().is_ok());
+                assert_eq!(receipts[0].body.kind, ReceiptKind::Read);
+            }
+            _ => panic!("expected Receipts"),
+        }
+    }
+
+    #[test]
+    fn put_receipt_without_grant_refused() {
+        use crate::receipt::{Receipt, ReceiptKind};
+        let mailbox = id("svc-rc2");
+        let sender = id("svc-rc2s");
+        let recipient = id("svc-rc2r");
+        let mut svc = MailService::new(MailboxStore::new(mailbox.node_id(), 100));
+        let receipt = Receipt::issue(&recipient, &"ab".repeat(32), ReceiptKind::Delivered, 5);
+        let reply = svc.handle(
+            &recipient.node_id(),
+            MailRequest::PutReceipt { for_sender: sender.node_id_hex(), receipt, grant: vec![] },
+            1,
+            &never_revoked,
+        );
+        assert!(matches!(reply, MailReply::Error { .. }));
+    }
+
+    #[test]
+    fn stranger_cannot_collect_receipts() {
+        let mailbox = id("svc-rc3");
+        let sender = id("svc-rc3s");
+        let stranger = id("svc-rc3x");
+        let mut svc = MailService::new(MailboxStore::new(mailbox.node_id(), 100));
+        let reply = svc.handle(
+            &stranger.node_id(),
+            MailRequest::CollectReceipts { sender: sender.node_id_hex(), grant: vec![] },
+            1,
+            &never_revoked,
+        );
+        assert!(matches!(reply, MailReply::Error { .. }));
     }
 
     #[test]

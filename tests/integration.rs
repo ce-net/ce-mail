@@ -9,6 +9,7 @@ use ce_identity::{Identity, NodeId};
 use ce_mail::client::{MailClient, SendOptions, Transport};
 use ce_mail::mailbox::{ABILITY_ACCEPT, MailboxStore};
 use ce_mail::proto::MailRequest;
+use ce_mail::receipt::ReceiptKind;
 use ce_mail::service::MailService;
 use ce_mail::{Envelope, EnvelopeBody};
 use std::cell::RefCell;
@@ -308,6 +309,191 @@ async fn threading_via_in_reply_to() {
     let (msgs, _) = sender_inbox.drain_inbox(&mb.node_id_hex(), 0, vec![]).await.unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].envelope.body.in_reply_to, first);
+}
+
+#[tokio::test]
+async fn paginated_inbox_drain_e2e() {
+    let net = Net::new();
+    let mb = idn("pg-mb");
+    let recip = idn("pg-rc");
+    let sender = idn("pg-sn");
+    net.install(&mb.node_id_hex(), MailService::new(MailboxStore::new(mb.node_id(), 100)));
+    let sc = client(&net, &sender);
+    for i in 0..6 {
+        sc.send(SendOptions {
+            to: recip.node_id_hex(),
+            subject: format!("m{i}"),
+            body: format!("b{i}").into_bytes(),
+            mailbox: Some(mb.node_id_hex()),
+            grant: accept_grant(&recip, &mb),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let rc = client(&net, &recip);
+    // Page 0..2, advance, until !more. Assert each page is bounded and union is the full inbox.
+    let mut cursor = 0;
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    loop {
+        let (msgs, next, more) =
+            rc.drain_inbox_page(&mb.node_id_hex(), cursor, 2, vec![]).await.unwrap();
+        assert!(msgs.len() <= 2);
+        pages += 1;
+        for m in msgs {
+            seen.push(m.envelope.body.subject.clone());
+        }
+        cursor = next;
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(seen, (0..6).map(|i| format!("m{i}")).collect::<Vec<_>>());
+    assert_eq!(pages, 3, "6 messages / page size 2 = 3 pages");
+}
+
+#[tokio::test]
+async fn read_receipt_round_trip_e2e() {
+    let net = Net::new();
+    let mb = idn("rr-mb");
+    let recip = idn("rr-rc");
+    let sender = idn("rr-sn");
+    net.install(&mb.node_id_hex(), MailService::new(MailboxStore::new(mb.node_id(), 100)));
+    let sc = client(&net, &sender);
+    let mid = sc
+        .send(SendOptions {
+            to: recip.node_id_hex(),
+            subject: "ack please".into(),
+            body: b"open me".to_vec(),
+            mailbox: Some(mb.node_id_hex()),
+            grant: accept_grant(&recip, &mb),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let rc = client(&net, &recip);
+    let (msgs, _) = rc.drain_inbox(&mb.node_id_hex(), 0, vec![]).await.unwrap();
+    assert_eq!(msgs.len(), 1);
+    // Recipient deposits a read receipt; the sender delegated this mailbox to accept on its behalf.
+    rc.send_receipt(
+        &mb.node_id_hex(),
+        &sender.node_id_hex(),
+        &msgs[0].id(),
+        ReceiptKind::Read,
+        accept_grant(&sender, &mb),
+    )
+    .await
+    .unwrap();
+    // Sender collects, verifies attribution.
+    let receipts = sc.collect_receipts(&mb.node_id_hex(), vec![]).await.unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].body.message_id, mid);
+    assert_eq!(receipts[0].body.by, recip.node_id_hex());
+    assert!(receipts[0].verify().is_ok());
+}
+
+#[tokio::test]
+async fn offline_replay_is_idempotent_across_redelivery() {
+    // Re-delivering the *same wire envelope* to the mailbox (e.g. a retry after a flaky link, or a
+    // gossip duplicate) must not duplicate it; the recipient sees exactly one copy after replay, and
+    // a redelivery even after an ack must not resurrect the message (the seen-set persists).
+    //
+    // Note: each `send` re-seals the body with a fresh ephemeral key, so two *fresh* sends of the
+    // same plaintext have different body CIDs and thus different message ids. The mailbox-level
+    // idempotence guarantee is about redelivering the identical signed envelope, which is what a
+    // retry/gossip actually carries — so we deliver the same `Envelope` value twice via the service.
+    let mb = idn("ir-mb");
+    let recip = idn("ir-rc");
+    let sender = idn("ir-sn");
+    let mut svc = MailService::new(MailboxStore::new(mb.node_id(), 100));
+    let grant = accept_grant(&recip, &mb);
+    let env = Envelope::seal(
+        &sender,
+        EnvelopeBody {
+            from: String::new(),
+            to: recip.node_id_hex(),
+            subject: "retry".into(),
+            body_cid: "ab".repeat(32),
+            attachment_cids: vec![],
+            in_reply_to: String::new(),
+            sent_at: 5,
+            postage_receipt: String::new(),
+        },
+    );
+    // First delivery stores; the redelivery is a duplicate.
+    let r1 = svc.handle(
+        &sender.node_id(),
+        MailRequest::Deliver { envelope: env.clone(), grant: grant.clone() },
+        1,
+        &never_revoked,
+    );
+    assert!(matches!(r1, ce_mail::MailReply::Delivered { duplicate: false }));
+    let r2 = svc.handle(
+        &sender.node_id(),
+        MailRequest::Deliver { envelope: env.clone(), grant: grant.clone() },
+        1,
+        &never_revoked,
+    );
+    assert!(matches!(r2, ce_mail::MailReply::Delivered { duplicate: true }));
+    assert_eq!(svc.store().pending_count(&recip.node_id_hex()), 1, "redelivery must de-dupe");
+
+    // Drain + ack to free the queue, then a late redelivery of the same id must not reappear.
+    let _ = svc.handle(
+        &recip.node_id(),
+        MailRequest::Ack { recipient: recip.node_id_hex(), cursor: 1, grant: vec![] },
+        2,
+        &never_revoked,
+    );
+    let r3 = svc.handle(
+        &sender.node_id(),
+        MailRequest::Deliver { envelope: env, grant },
+        3,
+        &never_revoked,
+    );
+    assert!(matches!(r3, ce_mail::MailReply::Delivered { duplicate: true }));
+    assert_eq!(
+        svc.store().pending_count(&recip.node_id_hex()),
+        0,
+        "post-ack redelivery of a seen id must not reappear"
+    );
+}
+
+#[tokio::test]
+async fn threaded_view_groups_replies_e2e() {
+    let net = Net::new();
+    let mb = idn("tv-mb");
+    let recip = idn("tv-rc");
+    let sender = idn("tv-sn");
+    net.install(&mb.node_id_hex(), MailService::new(MailboxStore::new(mb.node_id(), 100)));
+    let sc = client(&net, &sender);
+    let root = sc
+        .send(SendOptions {
+            to: recip.node_id_hex(),
+            subject: "design".into(),
+            body: b"v1".to_vec(),
+            mailbox: Some(mb.node_id_hex()),
+            grant: accept_grant(&recip, &mb),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    sc.send(SendOptions {
+        to: recip.node_id_hex(),
+        subject: "Re: design".into(),
+        body: b"v2".to_vec(),
+        in_reply_to: root.clone(),
+        mailbox: Some(mb.node_id_hex()),
+        grant: accept_grant(&recip, &mb),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let rc = client(&net, &recip);
+    let (convs, _) = rc.drain_inbox_threaded(&mb.node_id_hex(), 0, vec![]).await.unwrap();
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].len(), 2);
+    assert_eq!(convs[0].root, root);
 }
 
 #[tokio::test]

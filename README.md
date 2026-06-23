@@ -32,16 +32,18 @@ mesh request authorized by a signed, attenuating capability chain.
 
 ## Architecture
 
-Six small, independently testable modules:
+Eight small, independently testable modules:
 
 | Module | Responsibility |
 |---|---|
 | `crypto`   | Ed25519→X25519 **sealed-box** E2E body encryption (anonymous-sender, AEAD-authenticated). |
 | `envelope` | The small **signed envelope** (from/to/subject/body-CID/thread/postage); encode + verify. |
-| `proto`    | The mesh request/reply protocol: `Deliver` / `Drain` / `Ack`. |
-| `mailbox`  | The **store-and-forward store** (bounded, de-duplicated, persistable) + the capability gate. |
+| `thread`   | **Conversation modeling**: `in_reply_to` chain resolution (cycle-safe), `Re:`/`Fwd:` subject normalization, grouping a flat inbox into ordered, deduplicated `Conversation`s. |
+| `receipt`  | **Signed delivery/read receipts** — Ed25519-attributable acknowledgements the original sender can verify and collect. |
+| `proto`    | The mesh request/reply protocol: `Deliver` / `Drain` / `DrainPage` / `Ack` / `PutReceipt` / `CollectReceipts`. |
+| `mailbox`  | The **store-and-forward store** (bounded, de-duplicated, paginated, persistable) + a receipt mailbox + the capability gate. |
 | `service`  | Turns inbound requests into store operations (the mailbox-node side); pure, no I/O. |
-| `client`   | The high-level `MailClient`: `send`, `drain_inbox`, `ack`, `open_body`, behind a `Transport`. |
+| `client`   | The high-level `MailClient`: `send`, `drain_inbox`, `drain_inbox_page`, `drain_inbox_threaded`, `ack`, `send_receipt`, `collect_receipts`, `open_body`, behind a `Transport`. |
 
 ### Why split body from envelope?
 
@@ -129,14 +131,19 @@ valid delegate grant. This makes spam **non-amplifiable** at the storage layer.
 cargo test
 ```
 
-- **Unit** (51) — every public fn, happy + error paths, in each module.
-- **Integration** (8) — full flows over an in-memory transport: envelope round-trip, delivery+ack,
-  offline-store replay (order + content), the capability gate, E2E body encryption (incl. that the
-  stored blob never contains plaintext and an attacker can't decrypt), threading, idempotent delivery,
-  and dropped-peer handling.
-- **Property** (7, `proptest`) — seal/open recovers arbitrary plaintext; envelope sign→encode→decode
-  keeps verifying; message ids are deterministic; **no decoder panics** on arbitrary bytes;
-  ciphertext tampering always fails AEAD.
+- **Unit** (102) — every public fn, happy + error paths, in each module: subject normalization and
+  `in_reply_to` thread-root resolution (incl. cycle-safety and orphan replies), conversation grouping
+  and ordering, inbox pagination bounds/`more` signaling, signed-receipt issue/verify/dedup, the
+  receipt mailbox (idempotent deposit, capacity eviction, persistence), and the capability gate.
+- **Integration** (12) — full flows over an in-memory transport: envelope round-trip, delivery+ack,
+  offline-store replay (order + content, **idempotent across redelivery and post-ack**), paginated
+  inbox drain, threaded inbox view, signed **read-receipt round-trip** (issue→deposit→collect→verify),
+  the capability gate, E2E body encryption (incl. that the stored blob never contains plaintext and an
+  attacker can't decrypt), threading, idempotent delivery, and dropped-peer handling.
+- **Property** (11, `proptest`) — seal/open recovers arbitrary plaintext; envelope sign→encode→decode
+  keeps verifying; message ids are deterministic; subject normalization is idempotent and collapses
+  any stack of reply/forward prefixes; receipts round-trip and verify; **no decoder panics** on
+  arbitrary bytes; ciphertext tampering always fails AEAD.
 
 Failure injection (dropped peer, missing blob, malformed input, forged/tampered envelope, wrong
 recipient) is covered across unit, integration, and property suites — every path degrades gracefully
