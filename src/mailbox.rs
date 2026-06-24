@@ -261,6 +261,12 @@ impl MailboxStore {
     /// stores ([`from_bytes`](Self::from_bytes) still reads them) load with empty receipts. The
     /// `seen` / `receipts_seen` de-dup indexes are rebuilt on load, not persisted.
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.try_to_bytes().unwrap_or_default()
+    }
+
+    /// Fallible serialize: surfaces the bincode error instead of an empty vec, so a persistence
+    /// caller never silently writes a zero-byte (empty) store over a good one.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>> {
         bincode::serialize(&(
             STORE_MAGIC,
             self.self_id,
@@ -268,7 +274,7 @@ impl MailboxStore {
             self.capacity_per_recipient,
             &self.receipts,
         ))
-        .unwrap_or_default()
+        .map_err(|e| anyhow!("failed to serialize mailbox store: {e}"))
     }
 
     /// Load a store from bytes produced by [`to_bytes`](Self::to_bytes), or by an older version that
@@ -329,6 +335,66 @@ impl MailboxStore {
 
 /// Magic prefix tagging the v2 (receipt-carrying) on-disk store format.
 const STORE_MAGIC: u32 = 0x4345_4d32; // "CEM2"
+
+/// A thread-safe handle to a [`MailboxStore`] for a node that serves requests concurrently.
+///
+/// The single-threaded poll loop in the CLI does not need this, but a node that dispatches inbound
+/// requests across worker threads must serialize access so interleaved `accept`/`ack`/drain never
+/// lose an update or double-evict. [`SharedMailbox`] wraps the store in an `Arc<Mutex<_>>` and
+/// exposes exactly the operations a service needs, each taking the lock for the duration of one
+/// atomic store mutation. Clone is cheap (an `Arc` bump); all clones share one store.
+#[derive(Clone)]
+pub struct SharedMailbox {
+    inner: std::sync::Arc<std::sync::Mutex<MailboxStore>>,
+}
+
+impl SharedMailbox {
+    /// Wrap a store for concurrent access.
+    pub fn new(store: MailboxStore) -> Self {
+        SharedMailbox { inner: std::sync::Arc::new(std::sync::Mutex::new(store)) }
+    }
+
+    /// Run `f` against the locked store, returning its result. The lock is held only for the
+    /// closure. A poisoned lock (a previous panic while holding it) is surfaced as an error rather
+    /// than propagating the panic.
+    pub fn with<R>(&self, f: impl FnOnce(&mut MailboxStore) -> R) -> Result<R> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("mailbox lock poisoned"))?;
+        Ok(f(&mut guard))
+    }
+
+    /// Accept an envelope under the lock. See [`MailboxStore::accept`].
+    pub fn accept(&self, envelope: Envelope, now: u64) -> Result<Accepted> {
+        self.with(|s| s.accept(envelope, now))?
+    }
+
+    /// Acknowledge up to `cursor` under the lock. See [`MailboxStore::ack`].
+    pub fn ack(&self, recipient_hex: &str, up_to_cursor: usize) -> Result<usize> {
+        self.with(|s| s.ack(recipient_hex, up_to_cursor))
+    }
+
+    /// Read a page under the lock. See [`MailboxStore::read_page`].
+    pub fn read_page(
+        &self,
+        recipient_hex: &str,
+        since: usize,
+        limit: usize,
+    ) -> Result<(Vec<StoredEnvelope>, usize, bool)> {
+        self.with(|s| s.read_page(recipient_hex, since, limit))
+    }
+
+    /// Pending envelope count under the lock.
+    pub fn pending_count(&self, recipient_hex: &str) -> Result<usize> {
+        self.with(|s| s.pending_count(recipient_hex))
+    }
+
+    /// Snapshot the whole store to bytes under the lock (for atomic persistence).
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.with(|s| s.try_to_bytes())?
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -784,6 +850,67 @@ mod tests {
                 .check_accept_grant(&recipient.node_id(), &chain, 1000, &never_revoked)
                 .is_err()
         );
+    }
+
+    // ---- concurrency ----
+
+    #[test]
+    fn shared_mailbox_concurrent_deliver_no_lost_updates() {
+        // Many threads deliver distinct envelopes to one shared store concurrently; every accepted
+        // envelope must survive (no lost update from interleaved locking).
+        let mailbox = id("conc-mb");
+        let recip = id("conc-rc");
+        let recip_hex = recip.node_id_hex();
+        let shared = SharedMailbox::new(MailboxStore::new(mailbox.node_id(), 100_000));
+        let threads = 8usize;
+        let per_thread = 50usize;
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let shared = shared.clone();
+                let recip_hex = recip_hex.clone();
+                // Each thread builds its own sender identity so envelopes are distinct + valid.
+                let sender = id(&format!("conc-sn{t}"));
+                scope.spawn(move || {
+                    for i in 0..per_thread {
+                        let env = envelope_to(&sender, &recip_hex, &format!("t{t}-m{i}"));
+                        shared.accept(env, (t * 1000 + i) as u64).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(shared.pending_count(&recip_hex).unwrap(), threads * per_thread);
+    }
+
+    #[test]
+    fn shared_mailbox_interleaved_deliver_and_ack_is_consistent() {
+        // Interleave deliver and ack on a shared store from two threads; the store must never panic
+        // and the final count must be non-negative and bounded.
+        let mailbox = id("conc-mb2");
+        let recip = id("conc-rc2");
+        let sender = id("conc-sn2");
+        let recip_hex = recip.node_id_hex();
+        let shared = SharedMailbox::new(MailboxStore::new(mailbox.node_id(), 100_000));
+        std::thread::scope(|scope| {
+            let s1 = shared.clone();
+            let recip1 = recip_hex.clone();
+            scope.spawn(move || {
+                for i in 0..200u64 {
+                    let env = envelope_to(&sender, &recip1, &format!("m{i}"));
+                    let _ = s1.accept(env, i);
+                }
+            });
+            let s2 = shared.clone();
+            let recip2 = recip_hex.clone();
+            scope.spawn(move || {
+                for _ in 0..200 {
+                    // Ack whatever is currently present; clamped internally, never panics.
+                    let _ = s2.ack(&recip2, 1);
+                }
+            });
+        });
+        // No panic, and a valid count (0..=200) remains.
+        let n = shared.pending_count(&recip_hex).unwrap();
+        assert!(n <= 200);
     }
 
     #[test]

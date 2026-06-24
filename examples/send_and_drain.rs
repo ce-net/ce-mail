@@ -19,11 +19,19 @@ async fn main() -> anyhow::Result<()> {
 
     let client = MailClient::new(identity, CeTransport::local());
 
+    // A message with a sealed subject and an attachment — both E2E-encrypted; the mailbox sees only
+    // ciphertext and a redacted subject placeholder.
     let mid = client
         .send(SendOptions {
             to: to.clone(),
             subject: "hello from ce-mail".into(),
             body: b"This message is signed by me and sealed to you.".to_vec(),
+            attachments: vec![ce_mail::Attachment::new(
+                "greeting.txt",
+                "text/plain",
+                b"a sealed attachment, fetched lazily by CID".to_vec(),
+            )],
+            seal_subject: true,
             mailbox: mailbox.clone(),
             ..Default::default()
         })
@@ -35,7 +43,12 @@ async fn main() -> anyhow::Result<()> {
         let (msgs, cursor) = client.drain_inbox(&mb, 0, vec![]).await?;
         println!("inbox has {} message(s) (cursor now {cursor})", msgs.len());
         for m in &msgs {
-            println!("  {} | {} | {}", &m.id()[..16], m.envelope.body.subject, m.body_text());
+            // `m.subject()` recovers the sealed subject; the envelope's cleartext field is redacted.
+            println!("  {} | {} | {}", &m.id()[..16], m.subject(), m.body_text());
+            for i in 0..m.envelope.attachment_count() {
+                let a = client.open_attachment(&m.envelope, i).await?;
+                println!("    attachment[{i}]: {} ({}, {} bytes)", a.filename, a.content_type, a.len());
+            }
         }
     }
     Ok(())

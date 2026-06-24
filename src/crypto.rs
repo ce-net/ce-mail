@@ -147,9 +147,16 @@ pub fn open(recipient_ed25519_secret: &[u8; 32], sealed: &SealedBody) -> Result<
         .map_err(|_| anyhow!("AEAD open failed: wrong recipient or tampered ciphertext"))
 }
 
-/// Serialize a sealed body to deterministic bytes (for blob storage).
+/// Serialize a sealed body to deterministic bytes (for blob storage). Infallible in practice; use
+/// [`try_encode_sealed`] to surface the error.
 pub fn encode_sealed(s: &SealedBody) -> Vec<u8> {
-    bincode::serialize(s).unwrap_or_default()
+    try_encode_sealed(s).unwrap_or_default()
+}
+
+/// Fallible serialize of a sealed body — surfaces the bincode error rather than yielding an empty
+/// (corrupt) blob.
+pub fn try_encode_sealed(s: &SealedBody) -> Result<Vec<u8>> {
+    bincode::serialize(s).map_err(|e| anyhow!("failed to encode sealed body: {e}"))
 }
 
 /// Deserialize a sealed body from bytes.

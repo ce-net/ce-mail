@@ -77,9 +77,15 @@ ce-mail's answer is **postage**, layered:
    prioritize senders with delivered-work/spend history and deprioritize newcomers (`is_newcomer()`),
    exactly the trust gradient CE uses for compute. This is policy in the *app/recipient*, not the node.
 
-> Status: the envelope field and the verification hooks exist; *enforcing* a minimum postage and the
-> refund flow is recipient-side policy and is the next implementation milestone. The threat model
-> commits to the mechanism; the wiring to channels is documented, not yet shipped.
+> Status: **screening is now implemented** (`screening::ScreeningPolicy` + `MailClient::screen_inbox`).
+> A recipient's policy classifies inbound mail into inbox/spam/rejected: contacts and proven
+> (`Established`) senders are waived; a stranger must present a `postage_receipt` that a caller-
+> supplied verifier confirms is worth at least `require_postage(...)`, else the message is quarantined
+> as spam (lenient) or rejected (`strict()`). The reputation gradient is read from
+> `GET /history/:node_id` (`is_newcomer()`). What remains deferred is the **channel settlement half**:
+> locking the stranger's credits when the receipt is issued and the read-then-release-vs-keep refund
+> over a payment channel. The verification and policy are shipped and tested; the credit-locking/refund
+> settlement is the recipient-app/channel wiring beyond this crate.
 
 ## What ce-mail does NOT defend against (honest limits)
 

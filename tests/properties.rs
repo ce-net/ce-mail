@@ -5,8 +5,10 @@
 //! * the message id is a deterministic function of envelope content.
 
 use ce_identity::Identity;
+use ce_mail::attachment::Attachment;
 use ce_mail::crypto::{self, SealedBody};
 use ce_mail::envelope::{Envelope, EnvelopeBody, message_id};
+use ce_mail::limits::Limits;
 use ce_mail::proto::{MailReply, MailRequest};
 use ce_mail::receipt::{Receipt, ReceiptKind};
 use ce_mail::thread::normalize_subject;
@@ -154,5 +156,85 @@ proptest! {
     #[test]
     fn decode_receipt_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
         let _ = Receipt::decode(&bytes);
+    }
+
+    /// An attachment of arbitrary name/type/bytes survives encode→seal→open→decode unchanged.
+    #[test]
+    fn attachment_roundtrip_through_seal(
+        name in ".{0,64}",
+        ctype in "[a-z]{1,16}/[a-z]{1,16}",
+        bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+    ) {
+        let recip = recipient();
+        let a = Attachment::new(name, ctype, bytes);
+        let plaintext = a.encode().unwrap();
+        let sealed = crypto::seal(&recip.node_id(), &plaintext).unwrap();
+        let opened = crypto::open(&recip.secret_bytes(), &sealed).unwrap();
+        let back = Attachment::decode(&opened).unwrap();
+        prop_assert_eq!(a, back);
+    }
+
+    /// Arbitrary bytes never panic the attachment decoder.
+    #[test]
+    fn decode_attachment_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+        let _ = Attachment::decode(&bytes);
+    }
+
+    /// A subject longer than the limit is always rejected; one within it (with otherwise valid
+    /// fields) always passes. Bounds the DoS surface for any subject length.
+    #[test]
+    fn limits_reject_oversized_subject(extra in 0usize..8192) {
+        let limits = Limits::default();
+        let recip = recipient();
+        let snd = sender();
+        let subject = "x".repeat(limits.max_subject_bytes + extra);
+        let env = Envelope::seal(&snd, EnvelopeBody {
+            from: String::new(),
+            to: recip.node_id_hex(),
+            subject,
+            body_cid: "ab".repeat(32),
+            attachment_cids: vec![],
+            in_reply_to: String::new(),
+            sent_at: 1,
+            postage_receipt: String::new(),
+        });
+        // extra == 0 means exactly at the limit (allowed); any extra exceeds it (rejected).
+        if extra == 0 {
+            prop_assert!(limits.check_envelope(&env).is_ok());
+        } else {
+            prop_assert!(limits.check_envelope(&env).is_err());
+        }
+    }
+
+    /// clamp_page always returns a value in [1, max_page] for any requested limit.
+    #[test]
+    fn clamp_page_is_always_bounded(limit in any::<usize>()) {
+        let l = Limits::default();
+        let clamped = l.clamp_page(limit);
+        prop_assert!(clamped >= 1);
+        prop_assert!(clamped <= l.max_page);
+    }
+
+    /// Any attachment-cid count above the limit is rejected; within it (and otherwise valid) passes.
+    #[test]
+    fn limits_reject_too_many_attachments(n in 0usize..200) {
+        let limits = Limits::default();
+        let recip = recipient();
+        let snd = sender();
+        let env = Envelope::seal(&snd, EnvelopeBody {
+            from: String::new(),
+            to: recip.node_id_hex(),
+            subject: "ok".into(),
+            body_cid: "ab".repeat(32),
+            attachment_cids: (0..n).map(|_| "cd".repeat(32)).collect(),
+            in_reply_to: String::new(),
+            sent_at: 1,
+            postage_receipt: String::new(),
+        });
+        if n <= limits.max_attachments {
+            prop_assert!(limits.check_envelope(&env).is_ok());
+        } else {
+            prop_assert!(limits.check_envelope(&env).is_err());
+        }
     }
 }

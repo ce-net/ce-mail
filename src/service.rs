@@ -6,19 +6,32 @@
 //! `request`/`reply` loop.
 
 use crate::envelope::parse_node_id;
+use crate::limits::Limits;
 use crate::mailbox::{Accepted, MailboxStore};
 use crate::proto::{MailReply, MailRequest};
 use ce_identity::NodeId;
 
-/// A mailbox service over a [`MailboxStore`], gated by capabilities.
+/// A mailbox service over a [`MailboxStore`], gated by capabilities and resource [`Limits`].
 pub struct MailService {
     store: MailboxStore,
+    limits: Limits,
 }
 
 impl MailService {
-    /// Wrap a store in a service.
+    /// Wrap a store in a service with the default resource [`Limits`].
     pub fn new(store: MailboxStore) -> Self {
-        MailService { store }
+        MailService { store, limits: Limits::default() }
+    }
+
+    /// Wrap a store in a service with explicit resource [`Limits`] (a private mailbox may loosen
+    /// them; a public one may tighten them).
+    pub fn with_limits(store: MailboxStore, limits: Limits) -> Self {
+        MailService { store, limits }
+    }
+
+    /// The resource limits this service enforces.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     /// The underlying store (e.g. to persist it).
@@ -53,6 +66,11 @@ impl MailService {
                 // the recipient to this mailbox unless the recipient is delivering to themselves and
                 // we are their node. Here we always require the grant (open-relay protection): a
                 // mailbox stores mail only for recipients that delegated to it.
+                // Enforce resource bounds *before* the (cheap) capability check so an oversized
+                // payload is rejected as early as possible (DoS / memory-amplification guard).
+                if let Err(e) = self.limits.check_envelope(&envelope) {
+                    return MailReply::Error { message: e.to_string() };
+                }
                 if let Err(e) =
                     self.store.check_accept_grant(&recipient, &grant, now, is_revoked)
                 {
@@ -106,6 +124,9 @@ impl MailService {
                 {
                     return MailReply::Error { message: e };
                 }
+                // Clamp the requested page to the server-side ceiling so one request can never
+                // ask the mailbox for an unbounded number of envelopes.
+                let limit = self.limits.clamp_page(limit);
                 let (stored, cursor, more) = self.store.read_page(&recipient, since, limit);
                 let envelopes = stored.into_iter().map(|s| s.envelope).collect();
                 MailReply::Page { envelopes, cursor, more }
@@ -426,6 +447,94 @@ mod tests {
         let reply = svc.handle(
             &stranger.node_id(),
             MailRequest::CollectReceipts { sender: sender.node_id_hex(), grant: vec![] },
+            1,
+            &never_revoked,
+        );
+        assert!(matches!(reply, MailReply::Error { .. }));
+    }
+
+    #[test]
+    fn oversized_subject_is_rejected_before_storage() {
+        let mailbox = id("svc-lim1");
+        let recipient = id("svc-lim1r");
+        let sender = id("svc-lim1s");
+        let mut svc = MailService::new(MailboxStore::new(mailbox.node_id(), 100));
+        let body = EnvelopeBody {
+            from: String::new(),
+            to: recipient.node_id_hex(),
+            subject: "x".repeat(1_000_000),
+            body_cid: "ab".repeat(32),
+            attachment_cids: vec![],
+            in_reply_to: String::new(),
+            sent_at: 1,
+            postage_receipt: String::new(),
+        };
+        let env = Envelope::seal(&sender, body);
+        let grant = accept_grant(&recipient, &mailbox);
+        let reply = svc.handle(
+            &sender.node_id(),
+            MailRequest::Deliver { envelope: env, grant },
+            1000,
+            &never_revoked,
+        );
+        assert!(matches!(reply, MailReply::Error { .. }));
+        // Nothing stored — the oversized payload never reached the queue.
+        assert_eq!(svc.store().pending_count(&recipient.node_id_hex()), 0);
+    }
+
+    #[test]
+    fn drain_page_limit_is_clamped_to_server_ceiling() {
+        let mailbox = id("svc-lim2");
+        let recipient = id("svc-lim2r");
+        let sender = id("svc-lim2s");
+        let mut svc = MailService::new(MailboxStore::new(mailbox.node_id(), 1000));
+        let grant = accept_grant(&recipient, &mailbox);
+        for i in 0..3 {
+            svc.handle(
+                &sender.node_id(),
+                MailRequest::Deliver {
+                    envelope: envelope(&sender, &recipient.node_id_hex(), &format!("m{i}")),
+                    grant: grant.clone(),
+                },
+                1,
+                &never_revoked,
+            );
+        }
+        // A malicious huge limit must not crash or over-allocate; it is clamped (here all 3 fit).
+        let reply = svc.handle(
+            &recipient.node_id(),
+            MailRequest::DrainPage {
+                recipient: recipient.node_id_hex(),
+                since: 0,
+                limit: usize::MAX,
+                grant: vec![],
+            },
+            2,
+            &never_revoked,
+        );
+        match reply {
+            MailReply::Page { envelopes, cursor, more } => {
+                assert_eq!(envelopes.len(), 3);
+                assert_eq!(cursor, 3);
+                assert!(!more);
+            }
+            _ => panic!("expected Page"),
+        }
+    }
+
+    #[test]
+    fn tighter_limits_reject_a_subject_default_would_allow() {
+        let mailbox = id("svc-lim3");
+        let recipient = id("svc-lim3r");
+        let sender = id("svc-lim3s");
+        let tight = crate::limits::Limits { max_subject_bytes: 4, ..Default::default() };
+        let mut svc =
+            MailService::with_limits(MailboxStore::new(mailbox.node_id(), 100), tight);
+        let env = envelope(&sender, &recipient.node_id_hex(), "this subject is long");
+        let grant = accept_grant(&recipient, &mailbox);
+        let reply = svc.handle(
+            &sender.node_id(),
+            MailRequest::Deliver { envelope: env, grant },
             1,
             &never_revoked,
         );

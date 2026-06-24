@@ -64,6 +64,12 @@ enum Command {
         /// Postage receipt id (payment-channel receipt) to attach.
         #[arg(long, default_value = "")]
         postage: String,
+        /// Attach a file (repeatable). Each file is sealed E2E and stored as a lazy blob.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<PathBuf>,
+        /// Seal the subject E2E too (the envelope shows only a redaction placeholder to a mailbox).
+        #[arg(long)]
+        seal_subject: bool,
     },
     /// Drain your mailbox and list messages (saves them locally for `read`).
     Inbox {
@@ -100,14 +106,22 @@ enum Command {
         /// Max envelopes retained per recipient.
         #[arg(long, default_value_t = 10_000)]
         capacity: usize,
-        /// Path to persist the mailbox store (loaded on start, saved on each change).
+        /// Path to persist the mailbox store (loaded on start, saved atomically as it changes).
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Seconds between on-chain revocation-set refreshes (a revoked grant takes effect within
+        /// this window on a long-running mailbox).
+        #[arg(long, default_value_t = 60)]
+        revocation_refresh_secs: u64,
+        /// Poll interval (ms) for inbound mail when no streaming subscription is available.
+        #[arg(long, default_value_t = 500)]
+        poll_ms: u64,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
     let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir).with_context(|| format!("create {}", data_dir.display()))?;
@@ -119,7 +133,17 @@ async fn main() -> Result<()> {
             println!("{}", identity.node_id_hex());
             Ok(())
         }
-        Command::Send { to, subject, body, in_reply_to, mailbox, grant, postage } => {
+        Command::Send {
+            to,
+            subject,
+            body,
+            in_reply_to,
+            mailbox,
+            grant,
+            postage,
+            attach,
+            seal_subject,
+        } => {
             let body = match body {
                 Some(b) => b.into_bytes(),
                 None => read_stdin()?,
@@ -128,13 +152,25 @@ async fn main() -> Result<()> {
                 Some(g) => decode_chain(&g).context("decode --grant")?,
                 None => vec![],
             };
+            let mut attachments = Vec::with_capacity(attach.len());
+            for path in &attach {
+                let bytes =
+                    std::fs::read(path).with_context(|| format!("read attachment {}", path.display()))?;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "attachment".to_string());
+                attachments.push(ce_mail::Attachment::from_file(name, bytes));
+            }
             let client = MailClient::new(identity, CeTransport::new(ce_rs::CeClient::new(cli.node)));
             let mid = client
                 .send(SendOptions {
                     to,
                     subject,
                     body,
+                    attachments,
                     in_reply_to,
+                    seal_subject,
                     postage_receipt: postage,
                     mailbox,
                     grant: grant_chain,
@@ -158,11 +194,13 @@ async fn main() -> Result<()> {
                 .await
                 .context("drain inbox")?;
             print_inbox(&msgs);
+            // Persist the snapshot BEFORE advancing the cursor, so a crash never leaves a cursor
+            // pointing past mail that `read` can no longer see.
             save_snapshot(&snapshot_path, &msgs)?;
             write_cursor(&cursor_path, cursor)?;
             if ack && cursor > start {
                 let removed = client.ack(&mailbox, cursor, grant_chain).await.context("ack")?;
-                eprintln!("acked {removed} message(s)");
+                tracing::info!(removed, "acked message(s)");
             }
             Ok(())
         }
@@ -206,19 +244,38 @@ async fn main() -> Result<()> {
             println!("{token}");
             Ok(())
         }
-        Command::ServeMailbox { capacity, store } => {
-            serve_mailbox(identity, cli.node, capacity, store).await
+        Command::ServeMailbox { capacity, store, revocation_refresh_secs, poll_ms } => {
+            serve_mailbox(
+                identity,
+                cli.node,
+                capacity,
+                store,
+                revocation_refresh_secs,
+                poll_ms.max(50),
+            )
+            .await
         }
     }
 }
 
 /// Run the mailbox request loop: poll inbound app messages on [`MAIL_TOPIC`], handle each, reply.
+///
+/// Hardening over the naive loop: persistence is **atomic** (temp-file + fsync + rename, never a
+/// truncating in-place write) and is flushed at most once per drain batch only when the store
+/// actually changed (a dirty flag) rather than after every message; the on-chain revocation set is
+/// **refreshed** on an interval in a background task so a grant revoked after start takes effect;
+/// poll failures back off with a cap; and all logging uses `tracing`.
 async fn serve_mailbox(
     identity: Identity,
     node: String,
     capacity: usize,
     store_path: Option<PathBuf>,
+    revocation_refresh_secs: u64,
+    poll_ms: u64,
 ) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     let ce = ce_rs::CeClient::new(node);
     ce.subscribe(MAIL_TOPIC).await.context("subscribe to mail topic")?;
 
@@ -230,25 +287,49 @@ async fn serve_mailbox(
         _ => MailboxStore::new(identity.node_id(), capacity),
     };
     let mut svc = MailService::new(store);
-    // Revocation is consulted from the node's on-chain set.
-    let revoked = ce.revoked().await.unwrap_or_default();
-    let is_revoked = move |issuer: &ce_identity::NodeId, nonce: u64| {
-        let issuer_hex = hex::encode(issuer);
-        revoked.iter().any(|(i, n)| i == &issuer_hex && *n == nonce)
+
+    // Shared, periodically-refreshed revocation set so on-chain revocation takes effect on a
+    // long-running mailbox (was previously captured once at startup and never updated).
+    let revoked: Arc<Mutex<Vec<(String, u64)>>> =
+        Arc::new(Mutex::new(ce.revoked().await.unwrap_or_default()));
+    spawn_revocation_refresher(ce.clone(), revoked.clone(), revocation_refresh_secs.max(5));
+
+    let is_revoked = {
+        let revoked = revoked.clone();
+        move |issuer: &ce_identity::NodeId, nonce: u64| {
+            let issuer_hex = hex::encode(issuer);
+            match revoked.lock() {
+                Ok(set) => set.iter().any(|(i, n)| i == &issuer_hex && *n == nonce),
+                // A poisoned lock should fail closed (treat as revoked) rather than honor a grant.
+                Err(_) => true,
+            }
+        }
     };
 
-    eprintln!("ce-mail mailbox serving as {} (topic {MAIL_TOPIC})", identity.node_id_hex());
-    eprintln!("Recipients must grant you '{ABILITY_ACCEPT}' (see: ce-mail grant-mailbox).");
+    tracing::info!(
+        node = %identity.node_id_hex(),
+        topic = MAIL_TOPIC,
+        "ce-mail mailbox serving"
+    );
+    tracing::info!("recipients must grant '{ABILITY_ACCEPT}' (see: ce-mail grant-mailbox)");
 
+    let mut backoff_ms = poll_ms;
+    let max_backoff_ms = 30_000u64;
     loop {
         let messages = match ce.messages().await {
-            Ok(m) => m,
+            Ok(m) => {
+                backoff_ms = poll_ms; // healthy poll resets the backoff.
+                m
+            }
             Err(e) => {
-                eprintln!("warn: poll failed: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tracing::warn!(error = %e, backoff_ms, "mailbox poll failed; backing off");
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
                 continue;
             }
         };
+
+        let mut dirty = false;
         for msg in messages {
             if msg.topic != MAIL_TOPIC {
                 continue;
@@ -264,20 +345,86 @@ async fn serve_mailbox(
             };
             let req = match MailRequest::decode(&payload) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::debug!(error = %e, from = %msg.from, "ignoring malformed request");
+                    continue;
+                }
             };
+            let mutates = request_mutates(&req);
             let reply = svc.handle(&requester, req, now_secs(), &is_revoked);
-            if let Err(e) = ce.reply(token, &ce_mail::proto::MailReply::encode(&reply)).await {
-                eprintln!("warn: reply failed: {e}");
+            // Only mark dirty when the request could have changed the store AND was not an error.
+            if mutates && !matches!(reply, ce_mail::proto::MailReply::Error { .. }) {
+                dirty = true;
             }
-            if let Some(p) = &store_path
-                && let Err(e) = std::fs::write(p, svc.store().to_bytes())
-            {
-                eprintln!("warn: persist failed: {e}");
+            if let Err(e) = ce.reply(token, &ce_mail::proto::MailReply::encode(&reply)).await {
+                tracing::warn!(error = %e, "mailbox reply failed");
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Persist once per batch, atomically, only when something changed.
+        if dirty && let Some(p) = &store_path {
+            match svc.store().try_to_bytes() {
+                Ok(bytes) => {
+                    if let Err(e) = ce_mail::persist::atomic_write(p, &bytes) {
+                        tracing::error!(error = %e, path = %p.display(), "mailbox persist failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "mailbox serialize failed; skipping persist");
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
     }
+}
+
+/// Whether a request can mutate the store (so we only re-persist when it might have changed).
+fn request_mutates(req: &MailRequest) -> bool {
+    matches!(
+        req,
+        MailRequest::Deliver { .. }
+            | MailRequest::Ack { .. }
+            | MailRequest::PutReceipt { .. }
+            | MailRequest::CollectReceipts { .. }
+    )
+}
+
+/// Spawn a background task that refreshes the shared revocation set on an interval.
+fn spawn_revocation_refresher(
+    ce: ce_rs::CeClient,
+    revoked: std::sync::Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+    every_secs: u64,
+) {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(every_secs));
+        // Skip the immediate first tick (we already loaded the set once before spawning).
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match ce.revoked().await {
+                Ok(set) => {
+                    if let Ok(mut guard) = revoked.lock() {
+                        *guard = set;
+                        tracing::debug!("revocation set refreshed");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "revocation refresh failed; keeping last set"),
+            }
+        }
+    });
+}
+
+/// Initialize tracing from `RUST_LOG` (default `info`), writing to stderr. Idempotent-safe: a second
+/// call is a no-op because `try_init` returns an error we ignore.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 // ----- local snapshot persistence for `read` -----
@@ -301,7 +448,7 @@ fn print_inbox(msgs: &[Message]) {
             "{}  {}  {}",
             &m.id()[..16.min(m.id().len())],
             truncate(&m.envelope.body.from, 12),
-            m.envelope.body.subject
+            m.subject()
         );
     }
 }
@@ -312,12 +459,12 @@ fn save_snapshot(path: &std::path::Path, msgs: &[Message]) -> Result<()> {
         .map(|m| SnapMsg {
             id: m.id(),
             from: m.envelope.body.from.clone(),
-            subject: m.envelope.body.subject.clone(),
+            subject: m.subject(),
             in_reply_to: m.envelope.body.in_reply_to.clone(),
             body: m.body_text(),
         })
         .collect();
-    std::fs::write(path, serde_json::to_vec_pretty(&snap)?)?;
+    ce_mail::persist::atomic_write(path, &serde_json::to_vec_pretty(&snap)?)?;
     Ok(())
 }
 
@@ -331,7 +478,7 @@ fn read_cursor(path: &std::path::Path) -> usize {
 }
 
 fn write_cursor(path: &std::path::Path, cursor: usize) -> Result<()> {
-    std::fs::write(path, cursor.to_string())?;
+    ce_mail::persist::atomic_write(path, cursor.to_string().as_bytes())?;
     Ok(())
 }
 

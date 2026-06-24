@@ -96,9 +96,13 @@ pub enum MailReply {
 }
 
 impl MailRequest {
-    /// Encode to wire bytes.
+    /// Encode to wire bytes. Infallible in practice (see [`MailRequest::try_encode`]).
     pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+        self.try_encode().unwrap_or_default()
+    }
+    /// Fallible encode: surfaces the bincode error instead of an empty vec.
+    pub fn try_encode(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).map_err(|e| anyhow!("failed to encode mail request: {e}"))
     }
     /// Decode from wire bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -107,9 +111,13 @@ impl MailRequest {
 }
 
 impl MailReply {
-    /// Encode to wire bytes.
+    /// Encode to wire bytes. Infallible in practice (see [`MailReply::try_encode`]).
     pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+        self.try_encode().unwrap_or_default()
+    }
+    /// Fallible encode: surfaces the bincode error instead of an empty vec.
+    pub fn try_encode(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).map_err(|e| anyhow!("failed to encode mail reply: {e}"))
     }
     /// Decode from wire bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self> {

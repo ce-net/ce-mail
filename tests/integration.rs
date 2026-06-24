@@ -497,6 +497,220 @@ async fn threaded_view_groups_replies_e2e() {
 }
 
 #[tokio::test]
+async fn attachments_end_to_end_via_mailbox() {
+    use ce_mail::Attachment;
+    let net = Net::new();
+    let mb = idn("att-mb");
+    let recip = idn("att-rc");
+    let sender = idn("att-sn");
+    net.install(&mb.node_id_hex(), MailService::new(MailboxStore::new(mb.node_id(), 100)));
+    let sc = client(&net, &sender);
+    let pdf = Attachment::from_file("report.pdf", vec![0x25, 0x50, 0x44, 0x46, 0xff, 0x00]);
+    let txt = Attachment::new("note.txt", "text/plain", b"read me".to_vec());
+    sc.send(SendOptions {
+        to: recip.node_id_hex(),
+        subject: "files".into(),
+        body: b"see attached".to_vec(),
+        attachments: vec![pdf.clone(), txt.clone()],
+        mailbox: Some(mb.node_id_hex()),
+        grant: accept_grant(&recip, &mb),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let rc = client(&net, &recip);
+    let (msgs, _) = rc.drain_inbox(&mb.node_id_hex(), 0, vec![]).await.unwrap();
+    assert_eq!(msgs.len(), 1);
+    let env = &msgs[0].envelope;
+    assert_eq!(env.body.attachment_cids.len(), 2);
+    let all = rc.open_attachments(env).await.unwrap();
+    assert_eq!(all, vec![pdf, txt]);
+    // Filename + content-type travel sealed, recovered intact.
+    assert_eq!(all[0].filename, "report.pdf");
+    assert_eq!(all[0].content_type, "application/pdf");
+}
+
+#[tokio::test]
+async fn screening_quarantines_stranger_without_postage() {
+    use ce_mail::ScreeningPolicy;
+    let net = Net::new();
+    let mb = idn("scrn-mb");
+    let recip = idn("scrn-rc");
+    let friend = idn("scrn-fr");
+    let stranger = idn("scrn-st");
+    net.install(&mb.node_id_hex(), MailService::new(MailboxStore::new(mb.node_id(), 100)));
+    client(&net, &friend)
+        .send(SendOptions {
+            to: recip.node_id_hex(),
+            subject: "hi".into(),
+            body: b"trusted".to_vec(),
+            mailbox: Some(mb.node_id_hex()),
+            grant: accept_grant(&recip, &mb),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    client(&net, &stranger)
+        .send(SendOptions {
+            to: recip.node_id_hex(),
+            subject: "deal".into(),
+            body: b"spammy".to_vec(),
+            mailbox: Some(mb.node_id_hex()),
+            grant: accept_grant(&recip, &mb),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let rc = client(&net, &recip);
+    let policy = ScreeningPolicy::new(recip.node_id_hex()).allow(friend.node_id_hex());
+    let (inbox, spam, _) = rc
+        .screen_inbox(&mb.node_id_hex(), 0, vec![], &policy, |_| None)
+        .await
+        .unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].envelope.body.from, friend.node_id_hex());
+    assert_eq!(spam.len(), 1);
+    assert_eq!(spam[0].envelope.body.from, stranger.node_id_hex());
+}
+
+#[tokio::test]
+async fn postage_lets_a_stranger_reach_the_inbox() {
+    use ce_mail::ScreeningPolicy;
+    use ce_rs::Amount;
+    let net = Net::new();
+    let mb = idn("pst-mb");
+    let recip = idn("pst-rc");
+    let stranger = idn("pst-st");
+    net.install(&mb.node_id_hex(), MailService::new(MailboxStore::new(mb.node_id(), 100)));
+    client(&net, &stranger)
+        .send(SendOptions {
+            to: recip.node_id_hex(),
+            subject: "I paid".into(),
+            body: b"legit".to_vec(),
+            postage_receipt: "receipt-abc".into(),
+            mailbox: Some(mb.node_id_hex()),
+            grant: accept_grant(&recip, &mb),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let rc = client(&net, &recip);
+    let policy = ScreeningPolicy::new(recip.node_id_hex())
+        .require_postage(Amount::from_credits(1))
+        .strict();
+    // A verifier that confirms the named receipt is worth 5 credits.
+    let (inbox, spam, _) = rc
+        .screen_inbox(&mb.node_id_hex(), 0, vec![], &policy, |r| {
+            if r == "receipt-abc" { Some(Amount::from_credits(5)) } else { None }
+        })
+        .await
+        .unwrap();
+    assert_eq!(inbox.len(), 1, "stranger with valid postage reaches the inbox");
+    assert!(spam.is_empty());
+}
+
+#[tokio::test]
+async fn revocation_taking_effect_after_start_blocks_delivery() {
+    // The mailbox initially honors a grant, then the recipient revokes it; subsequent deliveries
+    // under the same grant are rejected. We model the refreshable revocation set with a Cell the
+    // is_revoked closure consults each call (exactly what the serve loop's shared set does).
+    let mb = idn("rev-mb");
+    let recip = idn("rev-rc");
+    let sender = idn("rev-sn");
+    let mut svc = MailService::new(MailboxStore::new(mb.node_id(), 100));
+    let grant = accept_grant(&recip, &mb); // nonce 1, issuer = recip
+    let revoked = std::cell::Cell::new(false);
+    let is_revoked = |issuer: &NodeId, nonce: u64| {
+        // Revoke recip's nonce-1 grant once the flag flips.
+        revoked.get() && issuer == &recip.node_id() && nonce == 1
+    };
+    // Before revocation: delivery stored.
+    let env1 = Envelope::seal(
+        &sender,
+        EnvelopeBody {
+            from: String::new(),
+            to: recip.node_id_hex(),
+            subject: "before".into(),
+            body_cid: "ab".repeat(32),
+            attachment_cids: vec![],
+            in_reply_to: String::new(),
+            sent_at: 1,
+            postage_receipt: String::new(),
+        },
+    );
+    let r1 = svc.handle(
+        &sender.node_id(),
+        MailRequest::Deliver { envelope: env1, grant: grant.clone() },
+        100,
+        &is_revoked,
+    );
+    assert!(matches!(r1, ce_mail::MailReply::Delivered { .. }));
+    // Recipient revokes; a refresh would surface it. Flip the flag.
+    revoked.set(true);
+    let env2 = Envelope::seal(
+        &sender,
+        EnvelopeBody {
+            from: String::new(),
+            to: recip.node_id_hex(),
+            subject: "after".into(),
+            body_cid: "cd".repeat(32),
+            attachment_cids: vec![],
+            in_reply_to: String::new(),
+            sent_at: 2,
+            postage_receipt: String::new(),
+        },
+    );
+    let r2 = svc.handle(
+        &sender.node_id(),
+        MailRequest::Deliver { envelope: env2, grant },
+        101,
+        &is_revoked,
+    );
+    assert!(matches!(r2, ce_mail::MailReply::Error { .. }), "revoked grant must be rejected");
+    // Only the pre-revocation message remains.
+    assert_eq!(svc.store().pending_count(&recip.node_id_hex()), 1);
+}
+
+#[tokio::test]
+async fn mailbox_store_survives_atomic_persist_and_reload() {
+    // A persisted store reloads intact, and an atomic write never leaves a corrupt file even after
+    // repeated rewrites (simulating the serve loop).
+    let dir = std::env::temp_dir().join(format!("ce-mail-it-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mb.bin");
+
+    let mb = idn("ap-mb");
+    let recip = idn("ap-rc");
+    let sender = idn("ap-sn");
+    let mut store = MailboxStore::new(mb.node_id(), 100);
+    for i in 0..5u64 {
+        let env = Envelope::seal(
+            &sender,
+            EnvelopeBody {
+                from: String::new(),
+                to: recip.node_id_hex(),
+                subject: format!("m{i}"),
+                body_cid: "ab".repeat(32),
+                attachment_cids: vec![],
+                in_reply_to: String::new(),
+                sent_at: i,
+                postage_receipt: String::new(),
+            },
+        );
+        store.accept(env, i).unwrap();
+        // Rewrite atomically each iteration like the serve loop.
+        ce_mail::persist::atomic_write(&path, &store.try_to_bytes().unwrap()).unwrap();
+    }
+    // Reload and confirm all five survived.
+    let bytes = std::fs::read(&path).unwrap();
+    let loaded = MailboxStore::from_bytes(&bytes).unwrap();
+    assert_eq!(loaded.pending_count(&recip.node_id_hex()), 5);
+}
+
+#[tokio::test]
 async fn duplicate_delivery_is_idempotent_end_to_end() {
     let net = Net::new();
     let mb = idn("id-mb");

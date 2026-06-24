@@ -117,9 +117,31 @@ impl Envelope {
         message_id(&self.body)
     }
 
+    /// The number of attachments this envelope references (without fetching any blob).
+    pub fn attachment_count(&self) -> usize {
+        self.body.attachment_cids.len()
+    }
+
     /// Encode to deterministic wire bytes (carried over AppRequest / stored at a mailbox).
+    ///
+    /// Serialization of a well-formed envelope cannot fail (all fields are owned, sized types), so
+    /// this is infallible in practice; [`Envelope::try_encode`] surfaces the bincode error for
+    /// callers that prefer to propagate it rather than rely on the invariant.
     pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+        self.try_encode().unwrap_or_default()
+    }
+
+    /// Fallible encode: returns the bincode error instead of an empty vec on the (practically
+    /// impossible) serialization failure. Prefer this on paths where a silent empty encode would
+    /// corrupt a stored message.
+    pub fn try_encode(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).map_err(|e| anyhow!("failed to encode envelope: {e}"))
+    }
+
+    /// The exact serialized byte length of this envelope, for the total-size limit check. Computed
+    /// without allocating the full buffer.
+    pub fn encoded_len(&self) -> usize {
+        bincode::serialized_size(self).map(|n| n as usize).unwrap_or(usize::MAX)
     }
 
     /// Decode from wire bytes. Does **not** verify the signature — call [`Envelope::verify`].

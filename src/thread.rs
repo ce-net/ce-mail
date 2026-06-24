@@ -27,6 +27,12 @@ const REPLY_PREFIXES: &[&str] = &["re", "fwd", "fw", "aw", "sv", "vs"];
 ///
 /// `"Re: Re: [2]  Hello   World"` and `"Fwd: hello world"` both normalize toward the same core so a
 /// reply and its parent group together even when an explicit pointer is absent.
+///
+/// ```
+/// use ce_mail::normalize_subject;
+/// assert_eq!(normalize_subject("Re: Fwd: Quarterly  Review"), "quarterly review");
+/// assert_eq!(normalize_subject("Reminder: pay rent"), "reminder: pay rent"); // not a "Re:" prefix
+/// ```
 pub fn normalize_subject(subject: &str) -> String {
     let mut s = subject.trim();
     loop {
