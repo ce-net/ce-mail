@@ -11,7 +11,7 @@
 use crate::envelope::Envelope;
 use crate::receipt::Receipt;
 use anyhow::{Result, anyhow};
-use ce_cap::SignedCapability;
+use ce_iam_core::SignedCapability;
 use serde::{Deserialize, Serialize};
 
 /// The app-messaging topic ce-mail uses for all requests.

@@ -4,7 +4,7 @@
 //! and end-to-end body encryption — plus failure injection (dropped peer, missing blob).
 
 use anyhow::{Result, anyhow};
-use ce_cap::{Caveats, Resource, SignedCapability};
+use ce_iam_core::{Caveats, Resource, SignedCapability};
 use ce_identity::{Identity, NodeId};
 use ce_mail::client::{MailClient, SendOptions, Transport};
 use ce_mail::mailbox::{ABILITY_ACCEPT, MailboxStore};

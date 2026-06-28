@@ -11,7 +11,7 @@
 //! Money is never a float; postage is a payment-channel receipt id (opaque string) per CE rules.
 
 use anyhow::{Context, Result, anyhow};
-use ce_cap::{Caveats, Resource, SignedCapability, decode_chain, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, decode_chain, encode_chain};
 use ce_identity::Identity;
 use ce_mail::client::{CeTransport, MailClient, Message, SendOptions};
 use ce_mail::mailbox::{ABILITY_ACCEPT, MailboxStore};

@@ -17,7 +17,7 @@ use crate::proto::{MAIL_TOPIC, MailReply, MailRequest};
 use crate::receipt::{Receipt, ReceiptKind};
 use crate::thread::{Conversation, group_threads};
 use anyhow::{Result, anyhow};
-use ce_cap::SignedCapability;
+use ce_iam_core::SignedCapability;
 use ce_identity::Identity;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -535,7 +535,7 @@ mod tests {
     use super::*;
     use crate::mailbox::{ABILITY_ACCEPT, MailboxStore};
     use crate::service::MailService;
-    use ce_cap::{Caveats, Resource};
+    use ce_iam_core::{Caveats, Resource};
     use ce_identity::{Identity, NodeId};
     use std::cell::RefCell;
     use std::collections::HashMap;

@@ -173,11 +173,11 @@ impl MailService {
         &self,
         recipient: &NodeId,
         requester: &NodeId,
-        grant: &[ce_cap::SignedCapability],
+        grant: &[ce_iam_core::SignedCapability],
         now: u64,
         is_revoked: &dyn Fn(&NodeId, u64) -> bool,
     ) -> Result<(), String> {
-        ce_cap::authorize(
+        ce_iam_core::authorize(
             recipient,
             &[*recipient],
             &[],
@@ -194,7 +194,7 @@ impl MailService {
 mod tests {
     use super::*;
     use crate::envelope::{Envelope, EnvelopeBody};
-    use ce_cap::{Caveats, Resource, SignedCapability};
+    use ce_iam_core::{Caveats, Resource, SignedCapability};
     use ce_identity::Identity;
 
     fn id(tag: &str) -> Identity {

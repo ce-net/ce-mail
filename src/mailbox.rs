@@ -23,7 +23,7 @@
 use crate::envelope::Envelope;
 use crate::receipt::Receipt;
 use anyhow::{Result, anyhow};
-use ce_cap::{SignedCapability, authorize};
+use ce_iam_core::{SignedCapability, authorize};
 use ce_identity::NodeId;
 use std::collections::HashMap;
 
@@ -400,7 +400,7 @@ impl SharedMailbox {
 mod tests {
     use super::*;
     use crate::envelope::EnvelopeBody;
-    use ce_cap::{Caveats, Resource};
+    use ce_iam_core::{Caveats, Resource};
     use ce_identity::Identity;
 
     fn id(tag: &str) -> Identity {
